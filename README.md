@@ -1,18 +1,26 @@
 # media-scope
 
-`media-scope` is a small, deterministic Python program that identifies an exact
-released movie, a complete ended television series, or the latest conservatively
-completed season of a returning series. It resolves metadata through the official
-TMDb v3 API and emits JSON suitable for a later program.
+`media-scope` is a deterministic Python media-management project with two independent
+components:
+
+- `media-scope` identifies an exact released movie, a complete ended television
+  series, or the latest conservatively completed season of a returning series through
+  the official TMDb v3 API.
+- `media-search-tv` consumes an eligible complete-series scope and searches configured
+  Jackett indexers for releases whose titles appear to cover the complete series.
 
 Its scope is intentionally narrow. It does not recommend media, scrape websites,
-search Jackett or torrent indexes, control download clients, download files, transfer
-files, or monitor folders.
+control download clients, download torrent payload data, follow magnet links, inspect
+torrent file lists, transfer files, or monitor folders. The Jackett component
+classifies only release titles and Torznab metadata; it does not approve a result or
+decide whether a work is legally distributable. It may retrieve a small `.torrent`
+metainfo response from Jackett solely to calculate its BitTorrent v1 infohash.
 
 ## Requirements
 
 - Python 3.12 or newer
-- A TMDb API Read Access Token
+- A TMDb API Read Access Token for scope generation
+- A running, user-configured Jackett service for complete-series searches
 
 ## Installation
 
@@ -52,6 +60,30 @@ TMDB_BEARER_TOKEN=replace_with_your_tmdb_read_access_token
 The `.env` file is ignored by Git. The token may instead be set directly in the
 process environment. It is sent only as an `Authorization: Bearer` header and is
 never logged.
+
+## Jackett configuration
+
+Install and configure Jackett separately, add the indexers you intend to use, and
+confirm they pass Jackett's own test. The API key is shown in the Jackett dashboard;
+copy it from the **API Key** field.
+
+Configure the local base URL and key in `.env`:
+
+```dotenv
+JACKETT_URL=http://127.0.0.1:9117
+JACKETT_API_KEY=replace_with_your_jackett_api_key
+JACKETT_INDEXERS=
+MEDIA_SEARCH_MIN_SEEDERS=0
+```
+
+`JACKETT_URL` accepts a trailing slash and can include a reverse-proxy path.
+`JACKETT_INDEXERS` is an optional comma-separated list of configured indexer IDs.
+When it is empty, the search tool asks Jackett for all configured indexers. The API
+key is never written to result JSON or logs, and Jackett API-key parameters are
+removed from serialized result URLs.
+
+`MEDIA_SEARCH_MIN_SEEDERS` is a ranking preference, not an acceptance filter. A
+correctly scoped zero-seeder release remains a candidate.
 
 ## Usage
 
@@ -98,6 +130,154 @@ A released movie result has this shape:
 
 Values always come from the current TMDb response; the example is illustrative.
 
+## Complete-series Jackett search
+
+First generate the complete ended-series scope:
+
+```powershell
+python -m media_scope tv "The Good Place" --year 2016 --pretty --output completed-show.json
+```
+
+Then search Jackett:
+
+```powershell
+python -m media_scope.search_tv `
+  --scope completed-show.json `
+  --output search-results.json `
+  --pretty
+```
+
+The installed console script is equivalent:
+
+```powershell
+media-search-tv --scope completed-show.json --pretty
+```
+
+Useful search options:
+
+```text
+--indexer INDEXER_ID   Restrict searching; may be supplied more than once.
+--fresh                Add Jackett's cache=false option.
+--include-rejected     Include complete details for rejected releases.
+--max-rejected N       Limit rejected details (default 25; 0 omits them).
+--min-seeders N        Override the ranking-only seeder preference.
+--verbose              Send search diagnostics to standard error.
+```
+
+The saved fixture can be used as an example scope:
+
+```powershell
+media-search-tv `
+  --scope tests\fixtures\scope_inputs\completed_tv.json `
+  --indexer your-configured-indexer-id `
+  --pretty
+```
+
+Every generated query and issued indexer request is recorded in the report. Jackett
+indexers are queried independently, so one failed indexer does not discard successful
+results from another.
+
+Every item in the final `candidates` array is acquisition-ready in one limited sense:
+it has a validated `magnet_uri` containing a valid BitTorrent v1 `xt=urn:btih:`
+topic. That magnet is the handoff contract for a future rTorrent component; this
+project still does not submit it or start a download. A provisional title match that
+cannot produce a usable magnet is moved to `rejected_results` with
+`NO_USABLE_MAGNET`.
+
+Magnet resolution runs only after normalization, deduplication, classification, and
+provisional ranking. It uses these fallbacks in order:
+
+1. A direct Torznab/Newznab `magneturl` attribute.
+2. A magnet already present in a result link, enclosure, GUID, or comments field.
+3. A tracker-free magnet constructed from a valid hexadecimal or Base32 BTIH
+   infohash.
+4. A bounded request to the result's authenticated Jackett download reference. The
+   response may be a magnet redirect, plain text, a small HTML link, or a public
+   `.torrent` metainfo file.
+
+For a `.torrent` response, the SHA-1 infohash is computed from the exact original raw
+bencoded `info` dictionary bytes. No file names, episode coverage, or payload content
+are validated. Tracker URLs from the metainfo are not added to the magnet. Explicitly
+private torrents are rejected as `PRIVATE_TORRENT_MAGNET_UNSUPPORTED`.
+
+An abbreviated successful report looks like:
+
+```json
+{
+  "schema_version": 1,
+  "result": "search_completed",
+  "media_type": "tv",
+  "scope": {
+    "tmdb_id": 66573,
+    "title": "The Good Place",
+    "expected_seasons": [1, 2, 3, 4],
+    "expected_season_count": 4
+  },
+  "search": {
+    "raw_result_count": 50,
+    "deduplicated_result_count": 35,
+    "provisional_candidate_count": 5,
+    "magnet_resolution_attempted_count": 5,
+    "magnet_resolution_succeeded_count": 3,
+    "magnet_resolution_failed_count": 2,
+    "accepted_candidate_count": 3
+  },
+  "candidates": [
+    {
+      "rank": 1,
+      "classification": "COMPLETE_SERIES",
+      "accepted_as_candidate": true,
+      "content_verified": false,
+      "original_title": "The.Good.Place.S01-S04.Complete.1080p.WEB-DL.x265",
+      "detected_seasons": [1, 2, 3, 4],
+      "missing_seasons": [],
+      "extra_seasons": [],
+      "size_bytes": 81412969851,
+      "seeders": 100,
+      "score": 96,
+      "source_indexers": ["example-indexer"],
+      "infohash": "0123456789abcdef0123456789abcdef01234567",
+      "magnet_uri": "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=The%20Good%20Place%20S01-S04%20Complete%201080p",
+      "magnet_source": "torznab_infohash"
+    }
+  ],
+  "warnings": []
+}
+```
+
+`magnet_source` identifies which fallback produced the final URI:
+`torznab_magneturl`, `result_field`, `torznab_infohash`, `jackett_redirect`,
+`jackett_plain_text`, `jackett_html`, or `jackett_torrent_file`.
+
+`content_verified: false` is always emitted. Reading the bencoded metadata required to
+derive an infohash does not verify the torrent's file contents or that it actually
+contains the expected seasons. Candidate status means only that the release title and
+Torznab metadata passed deterministic MVP rules and that a usable BTIH magnet was
+obtained.
+
+Jackett API-key parameters are retained only in the resolver's internal request
+reference. They are removed from serialized URLs, warnings, and logs. Magnets
+constructed from infohashes or metainfo are tracker-free, so private tracker
+credentials are not exposed.
+
+### Release classifications
+
+| Classification | Meaning |
+| --- | --- |
+| `COMPLETE_SERIES` | Strong complete-series phrase or exact expected-season coverage |
+| `COMPLETE_SERIES_CANDIDATE` | Plausible but conflicting, extra, or less precise coverage |
+| `MULTI_SEASON_PACK` | Multiple seasons that do not cover the expected series |
+| `SINGLE_SEASON_PACK` | One season; accepted only for a matching one-season series |
+| `SINGLE_EPISODE` | One explicit episode token |
+| `MULTI_EPISODE_PARTIAL` | Several explicit episode tokens |
+| `MOVIE_OR_UNRELATED` | Title or category contradicts the intended series |
+| `ANIME` | Explicit anime category or conservative anime release signal |
+| `UNKNOWN` | Title-only evidence is insufficient to classify safely |
+
+Individual episodes, partial multi-episode releases, anime, sports, inappropriate
+non-TV categories, and releases with known missing seasons are rejected. Seeder count
+cannot make an incomplete result acceptable.
+
 ## Eligibility and scope rules
 
 - A movie is eligible only when TMDb reports its status as `Released`.
@@ -128,6 +308,8 @@ exits with code 2, and asks the caller to rerun with `--tmdb-id`.
 
 ## Exit codes
 
+For `media-scope`:
+
 | Code | Meaning |
 | ---: | --- |
 | 0 | Eligible media resolved |
@@ -136,13 +318,23 @@ exits with code 2, and asks the caller to rerun with `--tmdb-id`.
 | 4 | TMDb authentication, record, network, response, or API failure |
 | 5 | Unexpected internal or output-file failure |
 
+For `media-search-tv`:
+
+| Code | Meaning |
+| ---: | --- |
+| 0 | Search completed, including zero-result or zero-candidate searches |
+| 2 | Invalid command line, file, JSON, or scope structure |
+| 3 | Valid but unsupported or ineligible scope |
+| 4 | Jackett configuration, authentication, discovery, or total indexer failure |
+| 5 | Unexpected internal or output-file failure |
+
 Every result or error is JSON on standard output. Logging is restricted to standard
 error.
 
 ## Tests and quality checks
 
 The automated suite uses fixtures and mocked HTTP transports; it makes no live TMDb
-requests.
+or Jackett requests.
 
 ```powershell
 python -m ruff format --check .
@@ -167,8 +359,17 @@ python -m ruff format .
 - Alternate, DVD, absolute, production, and anime-specific ordering are not
   supported.
 - Specials and Season 0 cannot be included.
-- No recommendation, torrent-search, downloading, transfer, or folder-monitoring
-  component is implemented.
+- Jackett matching is deliberately title-only and does not prove the torrent's file
+  contents. Fetching `.torrent` metainfo to derive an infohash does not change this.
+- Explicitly private `.torrent` files cannot be converted to public magnets in this
+  MVP and are rejected.
+- Daily-TV date numbering, sports, anime numbering, movies, partial-series
+  acquisition, and alternate episode ordering are outside the search MVP.
+- Tracker-specific release naming cannot be parsed exhaustively; uncertain results
+  are rejected or classified `UNKNOWN`.
+- Search does not download torrent payload data, submit to rTorrent, follow magnets,
+  scrape trackers directly, make copyright or licensing determinations, or
+  automatically approve a torrent.
 
 ## TMDb attribution
 
