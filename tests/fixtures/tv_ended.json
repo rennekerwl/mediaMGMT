@@ -1,0 +1,39 @@
+{
+  "id": 66573,
+  "name": "The Good Place",
+  "original_name": "The Good Place",
+  "first_air_date": "2016-09-19",
+  "last_air_date": "2020-01-30",
+  "status": "Ended",
+  "number_of_episodes": 3,
+  "original_language": "en",
+  "genres": [
+    {
+      "id": 35,
+      "name": "Comedy"
+    }
+  ],
+  "seasons": [
+    {
+      "id": 70000,
+      "season_number": 0,
+      "episode_count": 1,
+      "name": "Specials",
+      "air_date": "2016-09-12"
+    },
+    {
+      "id": 70002,
+      "season_number": 2,
+      "episode_count": 1,
+      "name": "Season 2",
+      "air_date": "2017-09-20"
+    },
+    {
+      "id": 70001,
+      "season_number": 1,
+      "episode_count": 2,
+      "name": "Season 1",
+      "air_date": "2016-09-19"
+    }
+  ]
+}

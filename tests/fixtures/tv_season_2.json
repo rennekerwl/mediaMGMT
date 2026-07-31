@@ -1,0 +1,16 @@
+{
+  "id": 70002,
+  "season_number": 2,
+  "name": "Season 2",
+  "air_date": "2017-09-20",
+  "episodes": [
+    {
+      "id": 2001,
+      "season_number": 2,
+      "episode_number": 1,
+      "name": "Everything Is Great!",
+      "air_date": "2017-09-20",
+      "runtime": 22
+    }
+  ]
+}
