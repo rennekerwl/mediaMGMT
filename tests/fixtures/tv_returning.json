@@ -1,0 +1,60 @@
+{
+  "id": 456,
+  "name": "Example Returning Show",
+  "original_name": "Example Returning Show",
+  "first_air_date": "2016-09-19",
+  "last_air_date": "2025-05-01",
+  "status": "Returning Series",
+  "number_of_episodes": 6,
+  "original_language": "en",
+  "genres": [
+    {
+      "id": 35,
+      "name": "Comedy"
+    }
+  ],
+  "next_episode_to_air": {
+    "id": 3002,
+    "season_number": 3,
+    "episode_number": 2,
+    "air_date": "2030-02-01",
+    "name": "The Next Episode"
+  },
+  "seasons": [
+    {
+      "id": 70000,
+      "season_number": 0,
+      "episode_count": 1,
+      "name": "Specials",
+      "air_date": "2016-09-12"
+    },
+    {
+      "id": 70001,
+      "season_number": 1,
+      "episode_count": 2,
+      "name": "Season 1",
+      "air_date": "2016-09-19"
+    },
+    {
+      "id": 70002,
+      "season_number": 2,
+      "episode_count": 1,
+      "name": "Season 2",
+      "air_date": "2017-09-20"
+    },
+    {
+      "id": 70003,
+      "season_number": 3,
+      "episode_count": 1,
+      "name": "Season 3",
+      "air_date": "2030-01-01"
+    },
+    {
+      "id": 70004,
+      "season_number": 4,
+      "episode_count": 0,
+      "name": "Season 4",
+      "air_date": null
+    }
+  ]
+}

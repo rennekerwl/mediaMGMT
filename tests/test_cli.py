@@ -53,7 +53,15 @@ class CliClient:
         ]
 
     def search_tv(self, _title: str, _year: int | None = None) -> list[dict[str, Any]]:
-        return []
+        return [
+            {
+                "id": self.tv["id"],
+                "name": self.tv["name"],
+                "original_name": self.tv["original_name"],
+                "first_air_date": self.tv["first_air_date"],
+                "overview": "Overview",
+            }
+        ]
 
 
 def make_factory(load_fixture: Any) -> Any:
@@ -62,6 +70,17 @@ def make_factory(load_fixture: Any) -> Any:
     seasons = {
         1: load_fixture("tv_season_1.json"),
         2: load_fixture("tv_season_2.json"),
+    }
+    return lambda token: CliClient(token, movie=movie, tv=tv, seasons=seasons)
+
+
+def make_returning_factory(load_fixture: Any) -> Any:
+    movie = load_fixture("movie_released.json")
+    tv = load_fixture("tv_returning.json")
+    seasons = {
+        1: load_fixture("tv_season_1.json"),
+        2: load_fixture("tv_season_2.json"),
+        3: load_fixture("tv_season_3_future.json"),
     }
     return lambda token: CliClient(token, movie=movie, tv=tv, seasons=seasons)
 
@@ -164,3 +183,63 @@ def test_output_write_failure_is_structured_exit_five(
     payload = json.loads(capsys.readouterr().out)
     assert exit_code == 5
     assert payload["error_code"] == "OUTPUT_WRITE_ERROR"
+
+
+def test_movie_rejects_latest_complete_season_flag(capsys: Any) -> None:
+    exit_code = main(["movie", "The Thing", "--latest-complete-season"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 2
+    assert payload["error_code"] == "INVALID_CLI_INPUT"
+
+
+def test_returning_tv_latest_complete_season_exits_zero(
+    monkeypatch: Any, capsys: Any, load_fixture: Any
+) -> None:
+    monkeypatch.setenv("TMDB_BEARER_TOKEN", "test-token")
+
+    exit_code = main(
+        ["tv", "--tmdb-id", "456", "--latest-complete-season"],
+        client_factory=make_returning_factory(load_fixture),
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["scope_type"] == "latest_complete_season"
+    assert payload["scope"]["seasons"][0]["season_number"] == 2
+
+
+def test_returning_tv_latest_complete_season_resolves_by_title(
+    monkeypatch: Any, capsys: Any, load_fixture: Any
+) -> None:
+    monkeypatch.setenv("TMDB_BEARER_TOKEN", "test-token")
+
+    exit_code = main(
+        [
+            "tv",
+            "Example Returning Show",
+            "--year",
+            "2016",
+            "--latest-complete-season",
+        ],
+        client_factory=make_returning_factory(load_fixture),
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["tmdb_id"] == 456
+
+
+def test_ended_tv_latest_complete_season_exits_three(
+    monkeypatch: Any, capsys: Any, load_fixture: Any
+) -> None:
+    monkeypatch.setenv("TMDB_BEARER_TOKEN", "test-token")
+
+    exit_code = main(
+        ["tv", "--tmdb-id", "66573", "--latest-complete-season"],
+        client_factory=make_factory(load_fixture),
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 3
+    assert payload["ineligibility_code"] == "TV_SERIES_NOT_RETURNING"
