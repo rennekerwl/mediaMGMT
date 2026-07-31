@@ -10,10 +10,11 @@ components:
   Jackett indexers for releases whose titles appear to cover the complete series.
 
 Its scope is intentionally narrow. It does not recommend media, scrape websites,
-control download clients, download torrents, follow magnet links, inspect torrent file
-lists, transfer files, or monitor folders. The Jackett component classifies only
-release titles and Torznab metadata; it does not approve a result or decide whether a
-work is legally distributable.
+control download clients, download torrent payload data, follow magnet links, inspect
+torrent file lists, transfer files, or monitor folders. The Jackett component
+classifies only release titles and Torznab metadata; it does not approve a result or
+decide whether a work is legally distributable. It may retrieve a small `.torrent`
+metainfo response from Jackett solely to calculate its BitTorrent v1 infohash.
 
 ## Requirements
 
@@ -176,6 +177,29 @@ Every generated query and issued indexer request is recorded in the report. Jack
 indexers are queried independently, so one failed indexer does not discard successful
 results from another.
 
+Every item in the final `candidates` array is acquisition-ready in one limited sense:
+it has a validated `magnet_uri` containing a valid BitTorrent v1 `xt=urn:btih:`
+topic. That magnet is the handoff contract for a future rTorrent component; this
+project still does not submit it or start a download. A provisional title match that
+cannot produce a usable magnet is moved to `rejected_results` with
+`NO_USABLE_MAGNET`.
+
+Magnet resolution runs only after normalization, deduplication, classification, and
+provisional ranking. It uses these fallbacks in order:
+
+1. A direct Torznab/Newznab `magneturl` attribute.
+2. A magnet already present in a result link, enclosure, GUID, or comments field.
+3. A tracker-free magnet constructed from a valid hexadecimal or Base32 BTIH
+   infohash.
+4. A bounded request to the result's authenticated Jackett download reference. The
+   response may be a magnet redirect, plain text, a small HTML link, or a public
+   `.torrent` metainfo file.
+
+For a `.torrent` response, the SHA-1 infohash is computed from the exact original raw
+bencoded `info` dictionary bytes. No file names, episode coverage, or payload content
+are validated. Tracker URLs from the metainfo are not added to the magnet. Explicitly
+private torrents are rejected as `PRIVATE_TORRENT_MAGNET_UNSUPPORTED`.
+
 An abbreviated successful report looks like:
 
 ```json
@@ -192,6 +216,10 @@ An abbreviated successful report looks like:
   "search": {
     "raw_result_count": 50,
     "deduplicated_result_count": 35,
+    "provisional_candidate_count": 5,
+    "magnet_resolution_attempted_count": 5,
+    "magnet_resolution_succeeded_count": 3,
+    "magnet_resolution_failed_count": 2,
     "accepted_candidate_count": 3
   },
   "candidates": [
@@ -203,16 +231,34 @@ An abbreviated successful report looks like:
       "original_title": "The.Good.Place.S01-S04.Complete.1080p.WEB-DL.x265",
       "detected_seasons": [1, 2, 3, 4],
       "missing_seasons": [],
-      "extra_seasons": []
+      "extra_seasons": [],
+      "size_bytes": 81412969851,
+      "seeders": 100,
+      "score": 96,
+      "source_indexers": ["example-indexer"],
+      "infohash": "0123456789abcdef0123456789abcdef01234567",
+      "magnet_uri": "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=The%20Good%20Place%20S01-S04%20Complete%201080p",
+      "magnet_source": "torznab_infohash"
     }
   ],
   "warnings": []
 }
 ```
 
-`content_verified: false` is always emitted because this component does not download
-or inspect `.torrent` metadata or its file list. Candidate status means only that the
-release title and Torznab metadata passed deterministic MVP rules.
+`magnet_source` identifies which fallback produced the final URI:
+`torznab_magneturl`, `result_field`, `torznab_infohash`, `jackett_redirect`,
+`jackett_plain_text`, `jackett_html`, or `jackett_torrent_file`.
+
+`content_verified: false` is always emitted. Reading the bencoded metadata required to
+derive an infohash does not verify the torrent's file contents or that it actually
+contains the expected seasons. Candidate status means only that the release title and
+Torznab metadata passed deterministic MVP rules and that a usable BTIH magnet was
+obtained.
+
+Jackett API-key parameters are retained only in the resolver's internal request
+reference. They are removed from serialized URLs, warnings, and logs. Magnets
+constructed from infohashes or metainfo are tracker-free, so private tracker
+credentials are not exposed.
 
 ### Release classifications
 
@@ -314,14 +360,16 @@ python -m ruff format .
   supported.
 - Specials and Season 0 cannot be included.
 - Jackett matching is deliberately title-only and does not prove the torrent's file
-  contents.
+  contents. Fetching `.torrent` metainfo to derive an infohash does not change this.
+- Explicitly private `.torrent` files cannot be converted to public magnets in this
+  MVP and are rejected.
 - Daily-TV date numbering, sports, anime numbering, movies, partial-series
   acquisition, and alternate episode ordering are outside the search MVP.
 - Tracker-specific release naming cannot be parsed exhaustively; uncertain results
   are rejected or classified `UNKNOWN`.
-- Search does not download anything, submit to rTorrent, follow magnets, scrape
-  trackers directly, make copyright or licensing determinations, or automatically
-  approve a torrent.
+- Search does not download torrent payload data, submit to rTorrent, follow magnets,
+  scrape trackers directly, make copyright or licensing determinations, or
+  automatically approve a torrent.
 
 ## TMDb attribution
 

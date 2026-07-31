@@ -8,6 +8,7 @@ import re
 import time
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC
 from email.utils import parsedate_to_datetime
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -31,7 +32,22 @@ SleepFunction = Callable[[float], None]
 _INDEXER_ID = re.compile(r"^[A-Za-z0-9._-]+$")
 _TORZNAB_NAMESPACE = "http://torznab.com/schemas/2015/feed"
 _MAX_XML_BYTES = 10 * 1024 * 1024
-_SECRET_QUERY_KEYS = {"apikey", "api_key", "passkey"}
+_SECRET_QUERY_KEYS = {
+    "apikey",
+    "api_key",
+    "jackett_apikey",
+    "jackett_api_key",
+    "passkey",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class AcquisitionResponse:
+    """Bounded HTTP response returned while resolving a Jackett acquisition reference."""
+
+    status_code: int
+    headers: dict[str, str]
+    content: bytes
 
 
 class JackettClient:
@@ -132,6 +148,70 @@ class JackettClient:
             query=query,
             sequence_start=sequence_start,
         )
+
+    def fetch_acquisition_reference(
+        self,
+        url: str,
+        *,
+        max_bytes: int,
+    ) -> AcquisitionResponse:
+        """Fetch one HTTP(S) acquisition reference without following redirects."""
+        parts = urlsplit(url)
+        if parts.scheme.casefold() not in {"http", "https"} or not parts.hostname:
+            raise JackettConfigurationError("Acquisition reference must be an HTTP(S) URL.")
+
+        for attempt in range(4):
+            try:
+                with self._client.stream("GET", url) as response:
+                    if response.status_code in (401, 403):
+                        raise JackettAuthenticationError(
+                            "Jackett rejected an acquisition-reference request."
+                        )
+                    retryable = response.status_code == 429 or (500 <= response.status_code <= 599)
+                    if retryable:
+                        if attempt == 3:
+                            raise JackettNetworkError(
+                                "Jackett acquisition resolution exhausted bounded retries."
+                            )
+                        delay = _retry_delay(response, attempt)
+                    elif 400 <= response.status_code:
+                        raise JackettApiError(
+                            f"Jackett acquisition resolution returned HTTP {response.status_code}."
+                        )
+                    else:
+                        content_length = _optional_int(response.headers.get("Content-Length"))
+                        if content_length is not None and content_length > max_bytes:
+                            raise JackettResponseError(
+                                "Jackett acquisition response exceeded the size limit."
+                            )
+                        if 300 <= response.status_code <= 399:
+                            content = b""
+                        else:
+                            body = bytearray()
+                            for chunk in response.iter_bytes():
+                                body.extend(chunk)
+                                if len(body) > max_bytes:
+                                    raise JackettResponseError(
+                                        "Jackett acquisition response exceeded the size limit."
+                                    )
+                            content = bytes(body)
+                        return AcquisitionResponse(
+                            status_code=response.status_code,
+                            headers=dict(response.headers),
+                            content=content,
+                        )
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                if attempt == 3:
+                    raise JackettNetworkError(
+                        "Jackett acquisition resolution failed after bounded retries."
+                    ) from exc
+                delay = float(2**attempt)
+            self._sleep(delay)
+        raise JackettNetworkError("Jackett acquisition resolution failed unexpectedly.")
+
+    def contains_configured_api_key(self, value: str) -> bool:
+        """Return whether text contains the configured Jackett API key."""
+        return bool(self._api_key) and self._api_key in value
 
     def _get_xml(
         self,
@@ -281,17 +361,34 @@ def parse_torznab_results(
             )
         )
         link = _child_text(item, "link")
+        guid_value = _child_text(item, "guid")
+        comments_value = _child_text(item, "comments")
         enclosure = next(
             (child for child in item if _local_name(child.tag) == "enclosure"),
             None,
         )
         enclosure_url = enclosure.get("url") if enclosure is not None else None
-        magnet = _first_attr(attrs, "magneturl")
-        if magnet is None:
-            for candidate in (link, enclosure_url):
-                if candidate and candidate.lower().startswith("magnet:"):
-                    magnet = candidate.strip()
-                    break
+        torznab_magnet = _first_attr(attrs, "magneturl")
+        result_field_magnets = tuple(
+            dict.fromkeys(
+                candidate.strip()
+                for candidate in (link, enclosure_url, guid_value, comments_value)
+                if candidate and candidate.strip().lower().startswith("magnet:")
+            )
+        )
+        magnet = torznab_magnet or (result_field_magnets[0] if result_field_magnets else None)
+        magnet_source = (
+            "torznab_magneturl"
+            if torznab_magnet
+            else ("result_field" if result_field_magnets else None)
+        )
+        internal_references = tuple(
+            dict.fromkeys(
+                candidate.strip()
+                for candidate in (link, enclosure_url, guid_value, comments_value)
+                if candidate and candidate.strip().lower().startswith(("http://", "https://"))
+            )
+        )
         download_url = next(
             (
                 sanitize_result_url(candidate)
@@ -308,8 +405,8 @@ def parse_torznab_results(
         size = _optional_int(_child_text(item, "size"))
         if size is None and enclosure is not None:
             size = _optional_int(enclosure.get("length"))
-        guid = sanitize_result_url(_child_text(item, "guid"))
-        details = sanitize_result_url(_child_text(item, "comments"))
+        guid = sanitize_result_url(guid_value)
+        details = sanitize_result_url(comments_value)
         warnings: list[str] = []
         source_name = indexer.name
         source_element = next(
@@ -342,9 +439,13 @@ def parse_torznab_results(
                 peers=peers if peers is None or peers >= 0 else None,
                 infohash=infohash,
                 magnet_uri=magnet.strip() if magnet else None,
+                magnet_source=magnet_source,
                 download_volume_factor=_optional_float(_first_attr(attrs, "downloadvolumefactor")),
                 upload_volume_factor=_optional_float(_first_attr(attrs, "uploadvolumefactor")),
                 warnings=tuple(warnings),
+                torznab_magnet_uri=torznab_magnet.strip() if torznab_magnet else None,
+                result_field_magnets=result_field_magnets,
+                internal_download_references=internal_references,
             )
         )
     return results

@@ -24,7 +24,7 @@ from media_scope.jackett_client import JackettClient
 from media_scope.models import JsonObject
 from media_scope.scope_input import load_search_scope
 from media_scope.search_service import search_complete_series
-from media_scope.serialization import serialize_json
+from media_scope.serialization import configure_utf8_stdio, serialize_json
 
 LOGGER = logging.getLogger("media_scope.search")
 ClientFactory = Callable[[str, str], JackettClient]
@@ -77,6 +77,7 @@ def main(
     client_factory: ClientFactory | None = None,
 ) -> int:
     """Run the search CLI and return its documented process exit code."""
+    configure_utf8_stdio()
     parser = build_search_parser()
     try:
         args = parser.parse_args(argv)

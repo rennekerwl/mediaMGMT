@@ -215,6 +215,31 @@ def test_no_candidates_is_valid_completed_search(
     )
 
 
+def test_unicode_release_title_is_valid_utf8_json(
+    monkeypatch: Any,
+    capsys: Any,
+) -> None:
+    configured(monkeypatch)
+    unicode_xml = """<rss><channel><item>
+      <title>The.Good.Place.S01-S04.Complete.中文</title>
+      <guid>unicode-result</guid><category>5000</category>
+      <attr name="infohash" value="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" />
+    </item></channel></rss>""".encode()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params["t"] == "caps":
+            return httpx.Response(200, content=(JACKETT_FIXTURES / "caps.xml").read_bytes())
+        return httpx.Response(200, content=unicode_xml)
+
+    exit_code = main(
+        ["--scope", str(SCOPE_PATH), "--indexer", "alpha"],
+        client_factory=factory_for(handler),
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["candidates"][0]["original_title"].endswith("中文")
+
+
 def test_output_write_failure_is_structured_exit_five(
     monkeypatch: Any,
     capsys: Any,

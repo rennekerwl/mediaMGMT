@@ -115,9 +115,17 @@ class RawRelease:
     peers: int | None = None
     infohash: str | None = None
     magnet_uri: str | None = None
+    magnet_source: str | None = None
     download_volume_factor: float | None = None
     upload_volume_factor: float | None = None
     warnings: tuple[str, ...] = ()
+    torznab_magnet_uri: str | None = field(default=None, repr=False, compare=False)
+    result_field_magnets: tuple[str, ...] = field(default=(), repr=False, compare=False)
+    internal_download_references: tuple[str, ...] = field(
+        default=(),
+        repr=False,
+        compare=False,
+    )
 
     @property
     def leechers(self) -> int | None:
@@ -129,7 +137,15 @@ class RawRelease:
     @property
     def has_usable_reference(self) -> bool:
         """Return whether a later component can identify or retrieve the result."""
-        return any((self.infohash, self.magnet_uri, self.download_url, self.guid))
+        return any(
+            (
+                self.infohash,
+                self.magnet_uri,
+                self.download_url,
+                self.guid,
+                self.internal_download_references,
+            )
+        )
 
     def source_dict(self) -> JsonObject:
         """Return the public source-occurrence representation."""
@@ -211,11 +227,13 @@ class CanonicalResult:
             "peers": release.peers,
             "infohash": release.infohash,
             "magnet_uri": release.magnet_uri,
+            "magnet_source": release.magnet_source,
             "download_url": release.download_url,
             "details_url": release.details_url,
             "download_volume_factor": release.download_volume_factor,
             "upload_volume_factor": release.upload_volume_factor,
             "categories": [category.to_dict() for category in self.categories],
+            "source_indexers": list(dict.fromkeys(source.indexer_id for source in self.sources)),
             "sources": [source.source_dict() for source in self.sources],
             "score": self.score,
             "score_reasons": self.score_reasons,

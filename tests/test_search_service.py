@@ -7,6 +7,8 @@ from typing import Any
 import pytest
 
 from media_scope.exceptions import AllIndexersFailedError, JackettNetworkError
+from media_scope.jackett_client import magnet_btih
+from media_scope.magnet_resolver import MagnetResolution, MagnetResolutionFailure
 from media_scope.release_classifier import normalize_release_title
 from media_scope.search_models import (
     IndexerCapabilities,
@@ -179,9 +181,13 @@ class ServiceClient:
     """Small service double with configurable per-indexer failures."""
 
     def __init__(self, *, fail: set[str] | None = None, empty: bool = False) -> None:
+        self.base_url = "http://127.0.0.1:9117"
         self.fail = fail or set()
         self.empty = empty
         self.calls: list[tuple[str, str, bool]] = []
+
+    def contains_configured_api_key(self, _value: str) -> bool:
+        return False
 
     def discover_indexers(self) -> list[IndexerCapabilities]:
         return [
@@ -223,7 +229,104 @@ def test_partial_indexer_failure_completes_with_diagnostics() -> None:
     assert payload["search"]["indexers_failed"] == ["beta"]
     assert payload["search"]["accepted_candidate_count"] == 1
     assert payload["candidates"][0]["rank"] == 1
+    assert payload["candidates"][0]["magnet_source"] == "torznab_infohash"
+    assert magnet_btih(payload["candidates"][0]["magnet_uri"]) == "a" * 40
     assert all(fresh for _indexer, _query, fresh in client.calls)
+
+
+def test_every_final_candidate_has_a_valid_btih_magnet_and_resolution_counts() -> None:
+    payload = search_complete_series(ServiceClient(), SCOPE)  # type: ignore[arg-type]
+    search = payload["search"]
+    assert search["provisional_candidate_count"] == 1
+    assert search["magnet_resolution_attempted_count"] == 1
+    assert search["magnet_resolution_succeeded_count"] == 1
+    assert search["magnet_resolution_failed_count"] == 0
+    for candidate in payload["candidates"]:
+        assert candidate["magnet_source"]
+        assert magnet_btih(candidate["magnet_uri"]) == candidate["infohash"]
+        assert candidate["source_indexers"] == ["alpha", "beta"]
+
+
+def test_unresolvable_provisional_candidate_moves_to_rejected_results() -> None:
+    class AlwaysFailsResolver:
+        def resolve(self, _result: Any) -> MagnetResolutionFailure:
+            return MagnetResolutionFailure(
+                "NO_USABLE_MAGNET",
+                "No usable magnet was available.",
+            )
+
+    payload = search_complete_series(  # type: ignore[arg-type]
+        ServiceClient(),
+        SCOPE,
+        include_rejected=True,
+        magnet_resolver=AlwaysFailsResolver(),  # type: ignore[arg-type]
+    )
+    assert payload["candidates"] == []
+    assert payload["search"]["provisional_candidate_count"] == 1
+    assert payload["search"]["magnet_resolution_failed_count"] == 1
+    assert "NO_USABLE_MAGNET" in payload["rejected_results"][0]["rejection_reasons"]
+    assert any(warning["code"] == "NO_USABLE_MAGNET_CANDIDATES" for warning in payload["warnings"])
+
+
+def test_failed_enrichment_is_removed_and_survivor_ranks_are_contiguous() -> None:
+    class TwoCandidateClient(ServiceClient):
+        def search(
+            self,
+            indexer: IndexerCapabilities,
+            query: str,
+            *,
+            fresh: bool,
+            sequence_start: int,
+        ) -> list[RawRelease]:
+            self.calls.append((indexer.id, query, fresh))
+            if indexer.id != "alpha" or query != "Example Show Complete Series":
+                return []
+            return [
+                raw(
+                    sequence_start,
+                    "Example Show S01-S05 1080p",
+                    infohash="a" * 40,
+                    guid="fail",
+                    seeders=100,
+                ),
+                raw(
+                    sequence_start + 1,
+                    "Example Show S01-S05 720p",
+                    infohash="b" * 40,
+                    guid="keep",
+                    seeders=1,
+                ),
+            ]
+
+    class SelectiveResolver:
+        def resolve(self, result: Any) -> MagnetResolution | MagnetResolutionFailure:
+            if result.release.infohash == "a" * 40:
+                return MagnetResolutionFailure(
+                    "JACKETT_RESOLUTION_FAILED",
+                    "Reference resolution failed.",
+                )
+            return MagnetResolution(
+                f"magnet:?xt=urn:btih:{'b' * 40}",
+                "b" * 40,
+                "torznab_infohash",
+            )
+
+    payload = search_complete_series(  # type: ignore[arg-type]
+        TwoCandidateClient(),
+        SCOPE,
+        include_rejected=True,
+        magnet_resolver=SelectiveResolver(),  # type: ignore[arg-type]
+    )
+    assert [candidate["rank"] for candidate in payload["candidates"]] == [1]
+    assert payload["candidates"][0]["infohash"] == "b" * 40
+    assert payload["search"]["magnet_resolution_succeeded_count"] == 1
+    assert payload["search"]["magnet_resolution_failed_count"] == 1
+    failed = next(value for value in payload["rejected_results"] if value["infohash"] == "a" * 40)
+    assert failed["rank"] is None
+    assert failed["rejection_reasons"] == [
+        "NO_USABLE_MAGNET",
+        "JACKETT_RESOLUTION_FAILED",
+    ]
 
 
 def test_no_results_is_completed_search_and_all_failures_raise() -> None:

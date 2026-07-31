@@ -22,7 +22,7 @@ from media_scope.exceptions import (
 from media_scope.models import JsonObject
 from media_scope.resolver import MediaType, resolve_media
 from media_scope.scope_builder import build_movie_scope, build_tv_scope
-from media_scope.serialization import serialize_json
+from media_scope.serialization import configure_utf8_stdio, serialize_json
 
 LOGGER = logging.getLogger("media_scope")
 ClientFactory = Callable[[str], TmdbClient]
@@ -65,6 +65,7 @@ def main(
     client_factory: ClientFactory | None = None,
 ) -> int:
     """Run the CLI and return its documented process exit code."""
+    configure_utf8_stdio()
     parser = build_parser()
     try:
         args = parser.parse_args(argv)

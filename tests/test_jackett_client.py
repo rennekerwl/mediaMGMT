@@ -59,6 +59,7 @@ def test_url_normalization_preserves_proxy_path_and_rejects_unsafe_values() -> N
 def test_result_url_removes_api_credentials_but_preserves_other_parameters() -> None:
     value = sanitize_result_url(
         "https://jackett.test/dl?APIKEY=secret&path=one&PASSKEY=also-secret"
+        "&jackett_apikey=third-secret"
     )
     assert value == "https://jackett.test/dl?path=one"
     magnet = "magnet:?xt=urn:btih:abcd&tr=https%3A%2F%2Ftracker"
@@ -153,6 +154,51 @@ def test_missing_optional_fields_and_link_only_result_do_not_crash() -> None:
     assert values[0].seeders is None
     assert values[0].infohash is None
     assert values[0].download_url == "https://jackett.test/dl?id=1"
+
+
+def test_magnets_are_captured_from_torznab_and_standard_result_fields() -> None:
+    infohashes = ["a" * 40, "b" * 40, "c" * 40, "d" * 40, "e" * 40, "f" * 40]
+    xml = f"""<rss xmlns:torznab="http://torznab.com/schemas/2015/feed"
+      xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/"><channel>
+      <item><title>One</title>
+        <torznab:attr name="magneturl" value="magnet:?xt=urn:btih:{infohashes[0]}" />
+      </item>
+      <item><title>Two</title><link>magnet:?xt=urn:btih:{infohashes[1]}</link></item>
+      <item><title>Three</title>
+        <enclosure url="magnet:?xt=urn:btih:{infohashes[2]}" />
+      </item>
+      <item><title>Four</title><guid>magnet:?xt=urn:btih:{infohashes[3]}</guid></item>
+      <item><title>Five</title>
+        <comments>magnet:?xt=urn:btih:{infohashes[4]}</comments>
+      </item>
+      <item><title>Six</title>
+        <newznab:attr name="magneturl" value="magnet:?xt=urn:btih:{infohashes[5]}" />
+      </item>
+    </channel></rss>""".encode()
+    indexer = IndexerCapabilities("alpha", "Alpha", False, True, ())
+    values = parse_torznab_results(xml, indexer=indexer, query="query")
+    assert [value.infohash for value in values] == infohashes
+    assert values[0].magnet_source == "torznab_magneturl"
+    assert all(value.magnet_source == "result_field" for value in values[1:5])
+    assert values[5].magnet_source == "torznab_magneturl"
+
+
+def test_authenticated_download_reference_is_internal_only() -> None:
+    xml = b"""<rss><channel><item>
+      <title>Example Show Complete Series</title>
+      <guid>https://jackett.test/dl?id=1&amp;Jackett_ApiKey=secret</guid>
+      <link>https://jackett.test/dl?id=1&amp;apikey=secret</link>
+    </item></channel></rss>"""
+    indexer = IndexerCapabilities("alpha", "Alpha", False, True, ())
+    value = parse_torznab_results(xml, indexer=indexer, query="query")[0]
+    assert value.internal_download_references == (
+        "https://jackett.test/dl?id=1&apikey=secret",
+        "https://jackett.test/dl?id=1&Jackett_ApiKey=secret",
+    )
+    serialized = value.source_dict()
+    assert "secret" not in repr(serialized)
+    assert value.download_url == "https://jackett.test/dl?id=1"
+    assert value.guid == "https://jackett.test/dl?id=1"
 
 
 def test_malformed_xml_and_entity_declarations_are_rejected() -> None:

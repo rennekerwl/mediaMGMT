@@ -6,6 +6,7 @@ import logging
 import math
 from collections import Counter
 from collections.abc import Iterable
+from dataclasses import replace
 
 from media_scope.exceptions import (
     AllIndexersFailedError,
@@ -13,6 +14,10 @@ from media_scope.exceptions import (
     JackettError,
 )
 from media_scope.jackett_client import JackettClient, magnet_btih
+from media_scope.magnet_resolver import (
+    MagnetResolution,
+    MagnetResolver,
+)
 from media_scope.models import JsonObject
 from media_scope.release_classifier import (
     classify_release,
@@ -54,6 +59,7 @@ def search_complete_series(
     min_seeders: int = 0,
     include_rejected: bool = False,
     max_rejected: int = 25,
+    magnet_resolver: MagnetResolver | None = None,
 ) -> JsonObject:
     """Search, classify, deduplicate, rank, and serialize complete-series results."""
     queries = build_search_queries(scope)
@@ -168,6 +174,47 @@ def search_complete_series(
 
     canonical = deduplicate_and_classify(raw_results, scope)
     rank_results(canonical, min_seeders=min_seeders)
+    provisional = sorted(
+        (value for value in canonical if value.evidence.accepted_as_candidate),
+        key=_ranking_key,
+    )
+    resolver = magnet_resolver or MagnetResolver(client)
+    resolution_succeeded = 0
+    resolution_failed = 0
+    for value in provisional:
+        resolution = resolver.resolve(value)
+        if isinstance(resolution, MagnetResolution):
+            value.release = replace(
+                value.release,
+                infohash=resolution.infohash,
+                magnet_uri=resolution.magnet_uri,
+                magnet_source=resolution.source,
+            )
+            resolution_succeeded += 1
+            continue
+        resolution_failed += 1
+        reasons = [*value.evidence.rejection_reasons, "NO_USABLE_MAGNET"]
+        if resolution.code != "NO_USABLE_MAGNET":
+            reasons.append(resolution.code)
+        value.evidence = replace(
+            value.evidence,
+            accepted_as_candidate=False,
+            rejection_reasons=tuple(dict.fromkeys(reasons)),
+            warnings=tuple(
+                dict.fromkeys(
+                    [
+                        *value.evidence.warnings,
+                        f"{resolution.code}: {resolution.message}",
+                        *(
+                            f"MAGNET_RESOLUTION_DIAGNOSTIC: {diagnostic}"
+                            for diagnostic in resolution.diagnostics
+                        ),
+                    ]
+                )
+            ),
+        )
+
+    rank_results(canonical, min_seeders=min_seeders)
     accepted = sorted(
         (value for value in canonical if value.evidence.accepted_as_candidate),
         key=_ranking_key,
@@ -191,6 +238,13 @@ def search_complete_series(
         )
     if not raw_results:
         warnings.append(json_warning("NO_SEARCH_RESULTS", "Jackett returned no search results."))
+    elif provisional and not accepted:
+        warnings.append(
+            json_warning(
+                "NO_USABLE_MAGNET_CANDIDATES",
+                "Search results were found, but none produced a usable magnet URI.",
+            )
+        )
     elif not accepted:
         warnings.append(
             json_warning(
@@ -225,6 +279,10 @@ def search_complete_series(
             "indexer_diagnostics": diagnostics,
             "raw_result_count": len(raw_results),
             "deduplicated_result_count": len(canonical),
+            "provisional_candidate_count": len(provisional),
+            "magnet_resolution_attempted_count": len(provisional),
+            "magnet_resolution_succeeded_count": resolution_succeeded,
+            "magnet_resolution_failed_count": resolution_failed,
             "accepted_candidate_count": len(accepted),
             "classification_counts": dict(sorted(classification_counts.items())),
             "rejection_counts": dict(sorted(rejection_counts.items())),
