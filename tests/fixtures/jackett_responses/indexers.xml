@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<indexers>
+  <indexer id="alpha" configured="True">
+    <title>Alpha Indexer</title>
+    <description>Fixture indexer</description>
+    <caps>
+      <searching>
+        <search available="yes" supportedParams="q" />
+        <tv-search available="yes" supportedParams="q" />
+      </searching>
+      <categories>
+        <category id="5000" name="TV">
+          <subcat id="5040" name="TV/HD" />
+        </category>
+      </categories>
+    </caps>
+  </indexer>
+  <indexer id="disabled" configured="False">
+    <title>Disabled Indexer</title>
+    <caps>
+      <searching>
+        <search available="yes" supportedParams="q" />
+      </searching>
+      <categories />
+    </caps>
+  </indexer>
+</indexers>

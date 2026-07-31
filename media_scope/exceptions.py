@@ -80,3 +80,61 @@ class AmbiguityError(MediaScopeError):
         self.query = query
         self.year = year
         self.candidates = candidates
+
+
+class SearchInputError(MediaScopeError):
+    """Raised when a search scope file is malformed or structurally invalid."""
+
+    error_code = "INVALID_SCOPE_INPUT"
+
+
+class UnsupportedSearchScopeError(MediaScopeError):
+    """Raised when a valid scope is outside complete ended-TV search support."""
+
+    error_code = "UNSUPPORTED_SCOPE"
+
+
+class JackettError(MediaScopeError):
+    """Base class for Jackett configuration and communication failures."""
+
+    error_code = "JACKETT_ERROR"
+
+
+class JackettConfigurationError(JackettError):
+    """Raised when Jackett configuration is missing or invalid."""
+
+    error_code = "JACKETT_CONFIGURATION_ERROR"
+
+
+class JackettAuthenticationError(JackettError):
+    """Raised when Jackett rejects the configured API key."""
+
+    error_code = "JACKETT_AUTHENTICATION_ERROR"
+
+
+class JackettNetworkError(JackettError):
+    """Raised when retryable Jackett failures exhaust the retry budget."""
+
+    error_code = "JACKETT_UNAVAILABLE"
+
+
+class JackettResponseError(JackettError):
+    """Raised when Jackett returns malformed or unsafe XML."""
+
+    error_code = "JACKETT_INVALID_RESPONSE"
+
+
+class JackettApiError(JackettError):
+    """Raised for non-retryable Jackett HTTP failures."""
+
+    error_code = "JACKETT_API_ERROR"
+
+
+class AllIndexersFailedError(JackettError):
+    """Raised when no selected Jackett indexer completes a valid query."""
+
+    error_code = "ALL_INDEXERS_FAILED"
+
+    def __init__(self, message: str, *, diagnostics: list[dict[str, Any]]) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics

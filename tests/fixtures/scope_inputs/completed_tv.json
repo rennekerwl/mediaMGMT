@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "result": "resolved",
+  "eligible": true,
+  "media_type": "tv",
+  "scope_type": "complete_series",
+  "tmdb_id": 66573,
+  "title": "The Good Place",
+  "original_title": "The Good Place",
+  "status": "Ended",
+  "first_air_year": 2016,
+  "scope": {
+    "season_count": 4,
+    "episode_count": 4,
+    "seasons": [
+      {"season_number": 1, "episodes": []},
+      {"season_number": 2, "episodes": []},
+      {"season_number": 3, "episodes": []},
+      {"season_number": 4, "episodes": []}
+    ]
+  },
+  "warnings": []
+}
