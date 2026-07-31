@@ -464,6 +464,232 @@ fails, the result is `NO_HEALTHY_TORRENT_FOUND` and exit code 6.
   shortened hashes in stderr logs, then inspect only that job's dedicated directory
   and named `media_probe_*` custom fields.
 
+## Full rTorrent payload download (Step 6)
+
+`media-download-torrent` consumes Step 5's successful JSON result and resumes the
+exact validated rTorrent item through full payload completion. It never submits the
+magnet again, never selects a fallback candidate, never erases the torrent, and never
+transfers payload files to the local PC. Step 7 will perform the SFTP transfer using
+the verified remote paths returned here.
+
+The handoff must have `result=candidate_health_validated` and a
+`selected_candidate` whose `status` is `READY_FOR_DOWNLOAD`. The candidate's
+`infohash`, magnet BTIH, and `rtorrent_hash` must all identify the same torrent. Step
+6 then queries `d.hash` (or the compatible `d.get_hash`) for the existing item. A
+missing item returns `SELECTED_TORRENT_NOT_FOUND` and requires Step 5 to be rerun;
+Step 6 does not silently re-add it.
+
+### Download configuration
+
+Step 6 reuses Step 5's `RTORRENT_RPC_*` settings and adds:
+
+```dotenv
+RTORRENT_DOWNLOAD_DIRECTORY=/srv/rtorrent/completed-media-downloads
+RTORRENT_MIN_FREE_SPACE_BYTES=10737418240
+RTORRENT_DOWNLOAD_POLL_INTERVAL_SECONDS=30
+RTORRENT_STALL_TIMEOUT_SECONDS=1800
+RTORRENT_DOWNLOAD_TIMEOUT_SECONDS=0
+RTORRENT_POST_COMPLETION_POLICY=stop
+RTORRENT_POST_PROCESS_GRACE_SECONDS=30
+RTORRENT_ALLOWED_FINAL_ROOTS=/srv/media/movies,/srv/media/tv
+```
+
+- `RTORRENT_DOWNLOAD_DIRECTORY` is a dedicated absolute server-side root. It cannot
+  be a filesystem root, the user's home, or overlap `RTORRENT_PROBE_DIRECTORY`.
+- `RTORRENT_MIN_FREE_SPACE_BYTES` is the reserve that must remain in addition to the
+  torrent's remaining bytes. The default is `0`; configure a production reserve.
+- `RTORRENT_DOWNLOAD_POLL_INTERVAL_SECONDS` defaults to 30 seconds.
+- `RTORRENT_STALL_TIMEOUT_SECONDS` defaults to 1800 seconds without useful progress.
+- `RTORRENT_DOWNLOAD_TIMEOUT_SECONDS=0` disables the overall timeout.
+- `RTORRENT_POST_COMPLETION_POLICY` accepts `stop` or `leave_running`. The CLI spelling
+  for the latter is `leave-running`.
+- `RTORRENT_POST_PROCESS_GRACE_SECONDS` defaults to 30 seconds, during which Step 6
+  observes external completion-hook effects.
+- `RTORRENT_ALLOWED_FINAL_ROOTS` is a comma-separated allowlist for final paths moved
+  outside the download root by trusted post-processing.
+
+The rTorrent process and the Step 6 process must see the configured paths as the same
+filesystem paths. Step 6 can check writability for its own process, but deployment
+permissions must also allow the rTorrent service account to write there.
+
+### Permanent directory and disk-space safety
+
+The destination is deterministic and sanitized:
+
+```text
+<download-root>/<tmdb-id>-<sanitized-title>-<first-8-infohash>/
+```
+
+Release text cannot inject separators or path traversal, and the resolved result must
+remain beneath the configured root. A preexisting directory is accepted only when
+the same rTorrent item or the deterministic `media_download_job_id` proves ownership;
+otherwise Step 6 returns `DOWNLOAD_PATH_COLLISION` rather than overwriting data.
+
+Before redirecting a stopped Step 5 torrent, Step 6 checks both rTorrent's completed
+byte count and any accessible on-disk bytes at the old base path. The current MVP
+does not guess how to relocate partial multi-file payload safely. If meaningful probe
+data exists outside the permanent directory, it is preserved and the command returns
+`PROBE_DATA_RELOCATION_REQUIRED`. An empty probe location is redirected with
+`d.directory.set`, read back for confirmation, and only then started.
+
+Before start, free space must satisfy:
+
+```text
+filesystem free bytes >= remaining torrent bytes + configured reserve
+```
+
+Already completed bytes reduce the remaining-byte requirement. The same check runs
+on every status poll. If space becomes insufficient, the torrent is stopped, its data
+is retained, its named state becomes `PAUSED_LOW_DISK_SPACE`, and the command returns
+`LOW_DISK_SPACE_DURING_DOWNLOAD`.
+
+### Progress, stalls, timeouts, and restart behavior
+
+Step 6 records explicit state transitions from `PENDING` and input validation through
+directory preparation, downloading, hash checking, completion grace, and
+`READY_FOR_TRANSFER`. It samples byte counts, remaining bytes, rates, peer counts,
+rTorrent messages, hash state, directory, and base path where the connected rTorrent
+version supports them.
+
+Only completed-byte growth, remaining-byte reduction, percentage growth, entry into
+hash checking, or completion resets the stall timer. Peer-count changes alone are not
+progress. At the stall deadline the torrent is stopped without deleting data and the
+report distinguishes `NO_CONNECTED_PEERS`, `CONNECTED_BUT_NO_PROGRESS`, or a
+`TRACKER_OR_NETWORK_ERROR`. A terminal local rTorrent error is reported separately.
+Step 6 does not abandon partial data or fall back to another Jackett candidate.
+
+Rerunning the same Step 5 result derives the same job ID from TMDb ID and infohash:
+
+- an active incomplete item continues to be monitored without a duplicate start;
+- a stopped incomplete item is revalidated and resumed;
+- an already complete item goes directly through completion verification;
+- a prior `STALLED` item requires the explicit `--resume-stalled` option; and
+- a missing item requires a fresh Step 5 run.
+
+The optional overall timeout stops and retains an incomplete torrent. A value of zero
+means there is no overall deadline.
+
+### Completion hooks, FileBot, and final paths
+
+Some existing rTorrent deployments have an `event.download.finished` hook such as a
+FileBot AMC script. Step 6 preserves all existing event hooks and never invokes,
+replaces, or removes them. It also never writes `d.custom1`. Ownership and progress
+use only these named fields through `d.custom.set`:
+
+```text
+media_download_job_id
+media_download_state
+media_download_source
+media_download_tmdb_id
+```
+
+After rTorrent reports all bytes complete, zero bytes remaining, no active download
+rate, and no hash check or terminal error, Step 6 enters `POST_PROCESSING_GRACE`. It
+records the base path before completion, polls during the grace period, and validates
+the final base path after any FileBot rename or move. A final path must exist beneath
+the download root or one of `RTORRENT_ALLOWED_FINAL_ROOTS`. Unexpected paths return
+`FINAL_PATH_OUTSIDE_ALLOWED_ROOT`; missing paths return `FINAL_PATH_NOT_FOUND`.
+
+With policy `stop`, the completed torrent is stopped but retained. With
+`leave_running`, an inactive completed torrent is started for seeding. Neither policy
+removes the torrent or its files.
+
+### Step 6 commands and JSON
+
+Validate the Step 5 JSON, live torrent identity and metadata, prospective paths, and
+disk space without starting, stopping, tagging, or redirecting the torrent:
+
+```powershell
+python -m media_scope.download_torrent `
+  --health-result health-result.json `
+  --dry-run `
+  --pretty
+```
+
+Resume and monitor the full download:
+
+```powershell
+python -m media_scope.download_torrent `
+  --health-result health-result.json `
+  --output download-result.json `
+  --poll-interval-seconds 30 `
+  --stall-timeout-seconds 1800 `
+  --download-timeout-seconds 0 `
+  --post-completion-policy stop `
+  --pretty
+```
+
+Resume a job that Step 6 previously marked stalled:
+
+```powershell
+python -m media_scope.download_torrent `
+  --health-result health-result.json `
+  --resume-stalled `
+  --pretty
+```
+
+The installed `media-download-torrent` command is equivalent. JSON is always written
+to standard output, `--output` receives the same bytes, and logs go only to standard
+error. A shortened, sanitized success result is:
+
+```json
+{
+  "schema_version": 1,
+  "result": "download_completed",
+  "job_id": "download-4608-abcdef123456",
+  "scope": {"tmdb_id": 4608, "title": "30 Rock"},
+  "candidate": {
+    "infohash": "abcdef1234567890abcdef1234567890abcdef12",
+    "release_title": "30 Rock S01-S07 Complete"
+  },
+  "storage": {
+    "download_directory": "/srv/rtorrent/completed-media-downloads/4608-30-rock-abcdef12",
+    "torrent_size_bytes": 81412969851,
+    "remaining_bytes": 81412969851,
+    "filesystem_free_bytes_at_start": 200000000000,
+    "required_reserve_bytes": 10737418240
+  },
+  "download": {
+    "status": "DOWNLOAD_COMPLETED",
+    "completed_bytes": 81412969851,
+    "remaining_bytes": 0
+  },
+  "paths": {
+    "download_root": "/srv/rtorrent/completed-media-downloads",
+    "rtorrent_base_path": "/srv/rtorrent/completed-media-downloads/4608-30-rock-abcdef12/30 Rock",
+    "final_base_path": "/srv/media/tv/30 Rock",
+    "top_level_paths": ["/srv/media/tv/30 Rock"],
+    "path_changed_after_completion": true
+  },
+  "rtorrent": {"final_state": "stopped", "torrent_retained": true},
+  "status": "READY_FOR_TRANSFER",
+  "ready_for_transfer": true,
+  "warnings": []
+}
+```
+
+RPC credentials, authentication headers, URL user information, queries, and fragments
+are never serialized. The report contains only the sanitized RPC endpoint.
+
+### Step 6 troubleshooting
+
+- **Selected torrent missing:** do not reload the magnet manually through Step 6.
+  Rerun Step 5 so torrent identity and metadata health are validated again.
+- **Probe relocation required:** inspect the retained Step 5 directory and arrange a
+  deliberate same-torrent relocation. No verified bytes were discarded.
+- **Insufficient or low disk space:** free space or increase storage, preserving the
+  configured reserve. A low-space torrent remains stopped with all payload retained.
+- **Stall:** inspect the report's peer and tracker diagnostics. After correcting the
+  swarm/network issue, use `--resume-stalled`; otherwise Step 6 will not restart it.
+- **Hash check:** 100% is not final while rTorrent reports hashing. A hash-check
+  failure is terminal and leaves the data for operator inspection.
+- **Final path missing or outside allowed roots:** inspect existing rTorrent/FileBot
+  completion logs. Add only trusted, dedicated library roots to the allowlist; do not
+  broadly allow a home directory or filesystem root.
+- **FileBot move:** ensure the hook updates rTorrent's base path within the configured
+  grace period. Increase `RTORRENT_POST_PROCESS_GRACE_SECONDS` if post-processing is
+  predictably slower.
+
 ## Eligibility and scope rules
 
 - A movie is eligible only when TMDb reports its status as `Released`.
@@ -527,6 +753,20 @@ For `media-probe-torrents`:
 | 7 | Cleanup failure requires operator attention |
 | 8 | Unexpected internal or output-file failure |
 
+For `media-download-torrent`:
+
+| Code | Meaning |
+| ---: | --- |
+| 0 | Download completed and verified for transfer, or dry-run passed |
+| 2 | Invalid command line or malformed Step 5 JSON |
+| 3 | Selected torrent missing, replaced, metadata-only, or invalid |
+| 4 | rTorrent configuration, authentication, RPC, or method failure |
+| 5 | Unsafe path, collision, relocation requirement, or insufficient disk space |
+| 6 | Download stalled |
+| 7 | Overall download timeout |
+| 8 | Post-processing or final-path validation failure |
+| 9 | Unexpected internal or output-file failure |
+
 Every result or error is JSON on standard output. Logging is restricted to standard
 error.
 
@@ -560,11 +800,29 @@ python -m pytest tests\test_rtorrent_integration.py -v
 It uses the configured dedicated probe directory and never contains a hard-coded test
 magnet.
 
+The full-download integration test is independently opt-in. It requires a successful
+Step 5 JSON file for a user-supplied legal, small torrent that already exists in
+rTorrent, plus an explicit dedicated destination. It prints its side effects, never
+erases a preexisting torrent, and performs no automatic file cleanup:
+
+```powershell
+$env:RUN_RTORRENT_DOWNLOAD_INTEGRATION_TESTS = "true"
+$env:RTORRENT_DOWNLOAD_INTEGRATION_HEALTH_RESULT = "C:\safe\legal-health-result.json"
+$env:RTORRENT_DOWNLOAD_INTEGRATION_DIRECTORY = "C:\safe\rtorrent-download-test"
+python -m pytest tests\test_rtorrent_download_integration.py -v -s
+```
+
 ## Current limitations
 
 - Only the first TMDb search-results page is considered.
 - TMDb's default language and region behavior is used.
 - Only standard TMDb season ordering is supported.
+- Step 6 deliberately returns `PROBE_DATA_RELOCATION_REQUIRED` instead of attempting
+  automatic relocation when Step 5 has already written meaningful payload data.
+- On-disk checks require the Step 6 process to see rTorrent's server-side paths. A
+  remote-only RPC deployment needs Step 6 to run on that server or share its mounts.
+- Existing completion hooks must update rTorrent's visible base path within the grace
+  period for moved files to be discovered automatically.
 - TMDb has no authoritative season-completion status. The returning-series mode is
   intentionally conservative and may select an older season until later-season
   metadata appears.
