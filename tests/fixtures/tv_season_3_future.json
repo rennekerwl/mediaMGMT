@@ -1,0 +1,16 @@
+{
+  "id": 70003,
+  "season_number": 3,
+  "name": "Season 3",
+  "air_date": "2030-01-01",
+  "episodes": [
+    {
+      "id": 3001,
+      "season_number": 3,
+      "episode_number": 1,
+      "name": "A Future Episode",
+      "air_date": "2030-01-01",
+      "runtime": 24
+    }
+  ]
+}

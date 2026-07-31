@@ -40,13 +40,20 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the public command-line parser."""
     parser = JsonArgumentParser(
         prog="media-scope",
-        description="Resolve a released movie or complete ended television series with TMDb.",
+        description=(
+            "Resolve a released movie, complete ended series, or latest completed season with TMDb."
+        ),
     )
     parser.add_argument("media_type", choices=("movie", "tv"))
     parser.add_argument("title", nargs="?", help="Title to search when --tmdb-id is absent.")
     parser.add_argument("--year", type=_valid_year, help="Release or first-air year.")
     parser.add_argument("--tmdb-id", type=_positive_int, help="Retrieve this exact TMDb record.")
     parser.add_argument("--output", type=Path, help="Also write the resulting JSON to this path.")
+    parser.add_argument(
+        "--latest-complete-season",
+        action="store_true",
+        help="For a returning TV series, return its latest provably completed season.",
+    )
     parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON.")
     parser.add_argument("--verbose", action="store_true", help="Enable informational logging.")
     return parser
@@ -63,6 +70,8 @@ def main(
         args = parser.parse_args(argv)
         if args.tmdb_id is None and (args.title is None or not args.title.strip()):
             raise CliInputError("title is required unless --tmdb-id is supplied")
+        if args.latest_complete_season and args.media_type != "tv":
+            raise CliInputError("--latest-complete-season is valid only for television")
     except CliInputError as exc:
         sys.stdout.write(serialize_json(_error_payload(exc.error_code, str(exc))))
         return 2
@@ -99,7 +108,15 @@ def main(
             payload = (
                 build_movie_scope(details)
                 if media_type == "movie"
-                else build_tv_scope(details, client)
+                else build_tv_scope(
+                    details,
+                    client,
+                    mode=(
+                        "latest_complete_season"
+                        if args.latest_complete_season
+                        else "complete_series"
+                    ),
+                )
             )
         exit_code = 0 if payload["eligible"] else 3
     except AmbiguityError as exc:

@@ -1,9 +1,9 @@
-"""Build eligible movie and complete-series acquisition scopes."""
+"""Build eligible movie, complete-series, and completed-season acquisition scopes."""
 
 from __future__ import annotations
 
 from datetime import date
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from media_scope.exceptions import InvalidResponseError
 from media_scope.models import (
@@ -16,6 +16,8 @@ from media_scope.models import (
 
 if TYPE_CHECKING:
     from media_scope.client import TmdbClient
+
+TvScopeMode = Literal["complete_series", "latest_complete_season"]
 
 
 def build_movie_scope(details: JsonObject) -> JsonObject:
@@ -78,9 +80,13 @@ def build_tv_scope(
     details: JsonObject,
     client: TmdbClient,
     *,
+    mode: TvScopeMode = "complete_series",
     today: date | None = None,
 ) -> JsonObject:
-    """Build the public eligibility and complete regular-season scope for a TV series."""
+    """Build a complete-series or latest-completed-season TV scope."""
+    if mode not in ("complete_series", "latest_complete_season"):
+        raise ValueError(f"Unsupported TV scope mode: {mode}")
+
     current_date = today or date.today()
     tmdb_id = _required_int(details, "id", "television series")
     status = details.get("status")
@@ -92,13 +98,21 @@ def build_tv_scope(
     base: JsonObject = {
         "schema_version": 1,
         "result": "resolved",
-        "eligible": status == "Ended",
+        "eligible": status == ("Ended" if mode == "complete_series" else "Returning Series"),
         "media_type": "tv",
         "tmdb_id": tmdb_id,
         "title": title,
         "original_title": original_title,
         "status": status,
     }
+    if mode == "latest_complete_season":
+        return _build_latest_complete_season_scope(
+            details=details,
+            client=client,
+            today=current_date,
+            base=base,
+        )
+
     if status != "Ended":
         base.update(
             {
@@ -251,6 +265,210 @@ def build_tv_scope(
         }
     )
     return base
+
+
+def _build_latest_complete_season_scope(
+    *,
+    details: JsonObject,
+    client: TmdbClient,
+    today: date,
+    base: JsonObject,
+) -> JsonObject:
+    status = details["status"]
+    if status != "Returning Series":
+        base.update(
+            {
+                "eligible": False,
+                "ineligibility_code": "TV_SERIES_NOT_RETURNING",
+                "ineligibility_reason": (
+                    "Latest-complete-season mode accepts only television series whose "
+                    "TMDb status is Returning Series."
+                ),
+                "warnings": [],
+            }
+        )
+        return base
+
+    warnings: list[ScopeWarning] = []
+    summaries = details.get("seasons")
+    if not isinstance(summaries, list):
+        warnings.append(
+            ScopeWarning(
+                "SEASON_SUMMARIES_MISSING",
+                "TMDb did not return a valid list of season summaries.",
+            )
+        )
+        return _scope_incomplete_result(base, warnings)
+
+    summary_counts: dict[int, int] = {}
+    for summary in summaries:
+        if not isinstance(summary, dict):
+            warnings.append(
+                ScopeWarning(
+                    "SEASON_SUMMARY_INVALID",
+                    "TMDb returned a season summary with an invalid structure.",
+                )
+            )
+            return _scope_incomplete_result(base, warnings)
+        season_number = summary.get("season_number")
+        if not isinstance(season_number, int):
+            warnings.append(
+                ScopeWarning(
+                    "SEASON_NUMBER_MISSING",
+                    "A TMDb season summary is missing its season number.",
+                )
+            )
+            return _scope_incomplete_result(base, warnings)
+        if season_number <= 0:
+            continue
+        if season_number in summary_counts:
+            warnings.append(
+                ScopeWarning(
+                    "DUPLICATE_SEASON_NUMBER",
+                    "TMDb returned duplicate regular-season summaries.",
+                    season_number=season_number,
+                )
+            )
+            return _scope_incomplete_result(base, warnings)
+        episode_count = summary.get("episode_count")
+        if not isinstance(episode_count, int) or episode_count < 0:
+            warnings.append(
+                ScopeWarning(
+                    "SEASON_EPISODE_COUNT_INVALID",
+                    "A regular-season summary has no valid episode count.",
+                    season_number=season_number,
+                )
+            )
+            return _scope_incomplete_result(base, warnings)
+        summary_counts[season_number] = episode_count
+
+    next_episode = details.get("next_episode_to_air")
+    next_episode_season: int | None = None
+    if next_episode is not None:
+        if not isinstance(next_episode, dict) or not isinstance(
+            next_episode.get("season_number"), int
+        ):
+            warnings.append(
+                ScopeWarning(
+                    "NEXT_EPISODE_METADATA_INVALID",
+                    "TMDb returned next-episode metadata without a valid season number.",
+                )
+            )
+            return _scope_incomplete_result(base, warnings)
+        next_episode_season = next_episode["season_number"]
+
+    regular_numbers = set(summary_counts)
+    for season_number, summary_count in sorted(
+        summary_counts.items(), key=lambda item: item[0], reverse=True
+    ):
+        if summary_count == 0:
+            continue
+        has_later_season_evidence = any(
+            later_number > season_number for later_number in regular_numbers
+        ) or (next_episode_season is not None and next_episode_season > season_number)
+        if not has_later_season_evidence:
+            continue
+        if next_episode_season == season_number:
+            continue
+
+        season_details = client.get_tv_season(int(base["tmdb_id"]), season_number)
+        episode_values = season_details.get("episodes")
+        if isinstance(episode_values, list) and _contains_future_episode(episode_values, today):
+            continue
+
+        episode_numbers_seen: set[tuple[int, int]] = set()
+        season, season_warnings, season_fatal = _build_season(
+            season_details=season_details,
+            expected_season_number=season_number,
+            summary_count=summary_count,
+            episode_numbers_seen=episode_numbers_seen,
+            today=today,
+        )
+        warnings.extend(season_warnings)
+
+        count_mismatch = isinstance(episode_values, list) and len(episode_values) != summary_count
+        incomplete_air_dates = _has_missing_or_invalid_episode_air_date(episode_values)
+        if season_fatal or count_mismatch or incomplete_air_dates or season is None:
+            return _scope_incomplete_result(base, warnings)
+
+        first_air_date = _optional_string(details.get("first_air_date"))
+        base.update(
+            {
+                "eligible": True,
+                "scope_type": "latest_complete_season",
+                "first_air_date": first_air_date,
+                "last_air_date": _optional_string(details.get("last_air_date")),
+                "first_air_year": _year_from_date(first_air_date),
+                "original_language": _optional_string(details.get("original_language")),
+                "genres": [genre.to_dict() for genre in _genres(details.get("genres"))],
+                "scope_policy": {
+                    "require_status": "Returning Series",
+                    "selection": "most recent fully completed regular season",
+                    "require_later_season_evidence": True,
+                    "include_regular_seasons": True,
+                    "include_season_zero": False,
+                    "include_specials": False,
+                    "episode_order": "TMDb standard season ordering",
+                },
+                "scope": {
+                    "season_count": 1,
+                    "episode_count": len(season.episodes),
+                    "seasons": [season.to_dict()],
+                },
+                "warnings": [warning.to_dict() for warning in warnings],
+            }
+        )
+        return base
+
+    base.update(
+        {
+            "eligible": False,
+            "ineligibility_code": "NO_COMPLETED_SEASON",
+            "ineligibility_reason": (
+                "No regular season could be conservatively proven complete from TMDb metadata."
+            ),
+            "warnings": [warning.to_dict() for warning in warnings],
+        }
+    )
+    return base
+
+
+def _scope_incomplete_result(base: JsonObject, warnings: list[ScopeWarning]) -> JsonObject:
+    base.update(
+        {
+            "eligible": False,
+            "ineligibility_code": "SCOPE_INCOMPLETE",
+            "ineligibility_reason": (
+                "The latest completed regular season could not be determined reliably "
+                "from TMDb metadata."
+            ),
+            "warnings": [warning.to_dict() for warning in warnings],
+        }
+    )
+    return base
+
+
+def _contains_future_episode(episode_values: list[object], today: date) -> bool:
+    for value in episode_values:
+        if not isinstance(value, dict):
+            continue
+        air_date = _optional_string(value.get("air_date"))
+        parsed_date = _parse_date(air_date) if air_date is not None else None
+        if parsed_date is not None and parsed_date > today:
+            return True
+    return False
+
+
+def _has_missing_or_invalid_episode_air_date(episode_values: object) -> bool:
+    if not isinstance(episode_values, list):
+        return True
+    for value in episode_values:
+        if not isinstance(value, dict):
+            return True
+        air_date = _optional_string(value.get("air_date"))
+        if air_date is None or _parse_date(air_date) is None:
+            return True
+    return False
 
 
 def _build_season(

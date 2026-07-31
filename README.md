@@ -1,9 +1,9 @@
 # media-scope
 
-`media-scope` is a small, deterministic Python program that answers one question:
-which exact released movie or complete ended television series did the user request?
-It resolves metadata through the official TMDb v3 API and emits JSON suitable for a
-later program.
+`media-scope` is a small, deterministic Python program that identifies an exact
+released movie, a complete ended television series, or the latest conservatively
+completed season of a returning series. It resolves metadata through the official
+TMDb v3 API and emits JSON suitable for a later program.
 
 Its scope is intentionally narrow. It does not recommend media, scrape websites,
 search Jackett or torrent indexes, control download clients, download files, transfer
@@ -60,6 +60,7 @@ Search by title, optionally narrowing by release or first-air year:
 ```powershell
 python -m media_scope movie "The Thing" --year 1982 --pretty
 python -m media_scope tv "The Good Place" --year 2016 --pretty
+python -m media_scope tv "The Simpsons" --year 1989 --latest-complete-season --pretty
 ```
 
 Bypass search when the exact TMDb record is already known:
@@ -102,7 +103,15 @@ Values always come from the current TMDb response; the example is illustrative.
 - A movie is eligible only when TMDb reports its status as `Released`.
 - A TV series is eligible only when TMDb reports its status as `Ended`.
 - Returning, in-production, planned, pilot, canceled, and all other TV statuses are
-  ineligible.
+  ineligible in the default mode.
+- `--latest-complete-season` is an explicit TV-only mode that accepts only
+  `Returning Series` and returns exactly one season.
+- A returning season is considered complete only when every listed episode has a
+  valid air date on or before today and TMDb provides evidence of a later regular
+  season. That evidence can be a higher-numbered season summary or
+  `next_episode_to_air` belonging to a higher season.
+- When the newest season lacks later-season evidence, the mode conservatively falls
+  back to an older provably completed season.
 - Season 0 and specials are excluded.
 - Every episode from each included regular-season detail response is included in
   standard TMDb season and episode order.
@@ -152,6 +161,9 @@ python -m ruff format .
 - Only the first TMDb search-results page is considered.
 - TMDb's default language and region behavior is used.
 - Only standard TMDb season ordering is supported.
+- TMDb has no authoritative season-completion status. The returning-series mode is
+  intentionally conservative and may select an older season until later-season
+  metadata appears.
 - Alternate, DVD, absolute, production, and anime-specific ordering are not
   supported.
 - Specials and Season 0 cannot be included.
