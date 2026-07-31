@@ -1,6 +1,6 @@
 # media-scope
 
-`media-scope` is a deterministic Python media-management project with two independent
+`media-scope` is a deterministic Python media-management project with three independent
 components:
 
 - `media-scope` identifies an exact released movie, a complete ended television
@@ -8,10 +8,12 @@ components:
   the official TMDb v3 API.
 - `media-search-tv` consumes an eligible complete-series scope and searches configured
   Jackett indexers for releases whose titles appear to cover the complete series.
+- `media-probe-torrents` consumes the ranked Jackett report and asks rTorrent to
+  retrieve magnet metadata, stopping after the first live candidate succeeds.
 
 Its scope is intentionally narrow. It does not recommend media, scrape websites,
-control download clients, download torrent payload data, follow magnet links, inspect
-torrent file lists, transfer files, or monitor folders. The Jackett component
+download complete torrent payloads, inspect torrent file lists, transfer files, or
+monitor folders. The Jackett component
 classifies only release titles and Torznab metadata; it does not approve a result or
 decide whether a work is legally distributable. It may retrieve a small `.torrent`
 metainfo response from Jackett solely to calculate its BitTorrent v1 infohash.
@@ -21,6 +23,8 @@ metainfo response from Jackett solely to calculate its BitTorrent v1 infohash.
 - Python 3.12 or newer
 - A TMDb API Read Access Token for scope generation
 - A running, user-configured Jackett service for complete-series searches
+- A running rTorrent instance exposed through a user-secured HTTP(S) XML-RPC gateway
+  for live health probes
 
 ## Installation
 
@@ -278,6 +282,188 @@ Individual episodes, partial multi-episode releases, anime, sports, inappropriat
 non-TV categories, and releases with known missing seasons are rejected. Seeder count
 cannot make an incomplete result acceptable.
 
+## Live rTorrent metadata validation (Step 5)
+
+`media-probe-torrents` is a live swarm-health gate after the title-based Jackett
+ranking. It processes accepted candidates in ascending original rank, temporarily
+starts each magnet, and selects the first one for which rTorrent retrieves BitTorrent
+metadata before the deadline. That is the complete MVP health rule.
+
+The indexer's `seeders` value remains in the report as historical source metadata. It
+is not added to, equated with, or substituted for rTorrent's live connected-peer
+statistics. Metadata retrieval shows that the magnet and swarm were usable enough to
+deliver metainfo at that moment. It does **not** prove that every payload byte remains
+available or that the full torrent will complete.
+
+This step deliberately does not inspect torrent file names, season coverage, episode
+coverage, or payload content. It trusts Step 4's release-title classification. A small
+amount of payload data may arrive between metadata retrieval and the immediate stop;
+zero payload bytes cannot be guaranteed.
+
+### rTorrent RPC configuration
+
+Expose rTorrent XML-RPC through a properly secured HTTP or HTTPS gateway and configure
+the complete endpoint. The program never assumes or appends `/RPC2` and does not
+connect directly to a public SCGI port.
+
+```dotenv
+RTORRENT_RPC_URL=https://rtorrent.example.internal/custom/RPC
+RTORRENT_RPC_USERNAME=
+RTORRENT_RPC_PASSWORD=
+RTORRENT_RPC_VERIFY_TLS=true
+RTORRENT_RPC_TIMEOUT_SECONDS=15
+RTORRENT_PROBE_DIRECTORY=/srv/rtorrent/media-probes
+RTORRENT_PROBE_MAX_CANDIDATES=10
+RTORRENT_METADATA_TIMEOUT_SECONDS=300
+RTORRENT_METADATA_POLL_INTERVAL_SECONDS=5
+RTORRENT_PREFLIGHT_MAGNET=
+RTORRENT_PREFLIGHT_TIMEOUT_SECONDS=120
+```
+
+Authentication is optional. When either username or password is set, HTTP Basic
+authentication is used. Credentials must be supplied in their dedicated settings,
+not embedded in the URL. The endpoint is sanitized in reports, and passwords and
+authentication headers are never logged. HTTPS certificates are verified by default.
+Setting `RTORRENT_RPC_VERIFY_TLS=false` is intended only for controlled local testing
+and produces a warning.
+
+At connection time the tool discovers `system.client_version`,
+`system.library_version`, and `system.api_version` where available. It inspects the
+connected instance's method list, prefers `load.start_verbose` or `load.start`, and
+falls back to `load.normal_verbose` or `load.normal` followed by `d.start`. If none of
+those compatible paths exists, it returns `MAGNET_SUBMISSION_UNSUPPORTED`; it never
+automates ruTorrent in a browser. Metadata detection prefers `d.is_meta == 0`. Older
+instances may use the explicitly reported `compatibility_fallback` based on regular
+torrent size/file-count fields.
+
+Check authentication, versions, and required methods without adding a torrent:
+
+```powershell
+python -m media_scope.probe_torrents check-connection --pretty
+```
+
+### Probe-directory safety
+
+`RTORRENT_PROBE_DIRECTORY` must be an absolute, dedicated path visible to the process
+and to rTorrent. It must not be `/`, a filesystem root, a home directory, or the normal
+completed-download directory. Each command creates an owner-only directory such as:
+
+```text
+/srv/rtorrent/media-probes/probe-20260731T120000Z-a1b2c3d4/<infohash>/
+```
+
+Release titles are never used as path components. Failed, script-created torrents are
+stopped and erased from rTorrent, then only their verified infohash child directory is
+removed. rTorrent erase is not assumed to delete data. Preexisting torrents and their
+files are never stopped, retagged, redirected, or erased. The shared probe root is
+never removed. `--keep-failed-probes` intentionally disables failed-probe cleanup for
+debugging and is dangerous.
+
+### Optional infrastructure preflight
+
+`RTORRENT_PREFLIGHT_MAGNET` may contain a user-supplied, known-good legal magnet. The
+tool probes and removes that item before evaluating candidates (unless it was already
+present). If preflight metadata cannot be retrieved, the command returns
+`RTORRENT_NETWORK_UNHEALTHY`, exits with code 5, and does not classify any candidate as
+unhealthy. No test magnet is built into this repository. Without a preflight, probing
+continues with a warning that candidate timeouts cannot be cleanly distinguished from
+a general DHT, tracker, firewall, or rTorrent networking problem.
+
+Use `--skip-preflight` to bypass a configured magnet for one run.
+
+### Probe commands and output
+
+Validate the input and planned order without contacting rTorrent:
+
+```powershell
+python -m media_scope.probe_torrents `
+  --search-results search-results.json `
+  --max-candidates 10 `
+  --dry-run `
+  --pretty
+```
+
+Run the live gate:
+
+```powershell
+python -m media_scope.probe_torrents `
+  --search-results search-results.json `
+  --output health-results.json `
+  --timeout-seconds 300 `
+  --poll-interval-seconds 5 `
+  --pretty
+```
+
+The installed `media-probe-torrents` console script is equivalent. JSON is always
+printed to standard output, and `--output` receives the same bytes. Logs go only to
+standard error. An abbreviated successful report is:
+
+```json
+{
+  "schema_version": 1,
+  "result": "candidate_health_validated",
+  "job_id": "probe-20260731T120000Z-a1b2c3d4",
+  "preflight": {"status": "NOT_CONFIGURED", "elapsed_seconds": 0},
+  "policy": {
+    "metadata_timeout_seconds": 300,
+    "poll_interval_seconds": 5,
+    "maximum_candidates": 10,
+    "content_validation_performed": false,
+    "stop_after_first_healthy": true
+  },
+  "attempts": [
+    {
+      "original_rank": 1,
+      "validated_rank": null,
+      "infohash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "status": "METADATA_TIMEOUT",
+      "metadata_retrieved": false,
+      "cleanup_performed": true
+    },
+    {
+      "original_rank": 2,
+      "validated_rank": 1,
+      "infohash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "status": "METADATA_RETRIEVED",
+      "metadata_retrieved": true,
+      "metadata_detection_method": "d.is_meta",
+      "cleanup_performed": false
+    }
+  ],
+  "selected_candidate": {
+    "original_rank": 2,
+    "validated_rank": 1,
+    "infohash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "rtorrent_state": "stopped",
+    "status": "READY_FOR_DOWNLOAD"
+  }
+}
+```
+
+The selected script-created torrent is stopped, retained in rTorrent, and tagged
+`media_probe_state=validated_waiting_for_download` so a future download controller can
+resume the same item. Preexisting healthy torrents are selected without being changed
+and are reported as `preexisting_unchanged`. Lower-ranked candidates are not claimed
+to be less healthy; they are listed as unattempted. If every attempted candidate
+fails, the result is `NO_HEALTHY_TORRENT_FOUND` and exit code 6.
+
+### rTorrent probe troubleshooting
+
+- **Authentication failure:** confirm the gateway accepts Basic authentication at the
+  exact configured URL. Use `check-connection`; do not put credentials in the URL.
+- **Metadata timeout:** peer counts are diagnostic only. Confirm rTorrent has working
+  DNS, outbound tracker access, DHT/UDP connectivity where applicable, and firewall
+  rules. A configured known-good preflight separates infrastructure failure from a
+  candidate-specific timeout.
+- **Preflight failure:** fix the rTorrent host's network, tracker, DHT, proxy, or
+  gateway configuration before retrying candidates. Candidates are not blamed.
+- **Unsupported magnet submission:** inspect the `check-connection` method report and
+  expose a supported `load.start*` or `load.normal*` RPC method. Browser automation and
+  ruTorrent UI fallbacks are intentionally unsupported.
+- **Cleanup failure:** exit code 7 requires operator attention. Use the job ID and
+  shortened hashes in stderr logs, then inspect only that job's dedicated directory
+  and named `media_probe_*` custom fields.
+
 ## Eligibility and scope rules
 
 - A movie is eligible only when TMDb reports its status as `Released`.
@@ -328,13 +514,26 @@ For `media-search-tv`:
 | 4 | Jackett configuration, authentication, discovery, or total indexer failure |
 | 5 | Unexpected internal or output-file failure |
 
+For `media-probe-torrents`:
+
+| Code | Meaning |
+| ---: | --- |
+| 0 | Healthy candidate selected, or diagnostic/dry-run completed |
+| 2 | Invalid command line or malformed search JSON |
+| 3 | Valid search input contains no probeable candidates |
+| 4 | rTorrent configuration, authentication, RPC, or method failure |
+| 5 | Known-good infrastructure preflight failed |
+| 6 | Probe completed but no healthy torrent was found |
+| 7 | Cleanup failure requires operator attention |
+| 8 | Unexpected internal or output-file failure |
+
 Every result or error is JSON on standard output. Logging is restricted to standard
 error.
 
 ## Tests and quality checks
 
-The automated suite uses fixtures and mocked HTTP transports; it makes no live TMDb
-or Jackett requests.
+The normal automated suite uses fixtures and mocked HTTP/XML-RPC transports; it makes
+no live TMDb, Jackett, or rTorrent requests.
 
 ```powershell
 python -m ruff format --check .
@@ -347,6 +546,19 @@ To apply formatting:
 ```powershell
 python -m ruff format .
 ```
+
+The live rTorrent integration test is opt-in only. Before enabling it, note that it
+temporarily adds, starts, stops, and erases the user-supplied legal magnet. It skips
+without modifying anything if that hash already exists:
+
+```powershell
+$env:RUN_RTORRENT_INTEGRATION_TESTS = "true"
+$env:RTORRENT_INTEGRATION_TEST_MAGNET = "magnet:?xt=urn:btih:<legal-test-hash>"
+python -m pytest tests\test_rtorrent_integration.py -v
+```
+
+It uses the configured dedicated probe directory and never contains a hard-coded test
+magnet.
 
 ## Current limitations
 
@@ -367,9 +579,12 @@ python -m ruff format .
   acquisition, and alternate episode ordering are outside the search MVP.
 - Tracker-specific release naming cannot be parsed exhaustively; uncertain results
   are rejected or classified `UNKNOWN`.
-- Search does not download torrent payload data, submit to rTorrent, follow magnets,
-  scrape trackers directly, make copyright or licensing determinations, or
-  automatically approve a torrent.
+- The live gate proves only timely metadata retrieval. It does not verify files,
+  seasons, episodes, payload availability, legal status, or eventual completion.
+- A locally accessible probe-directory path is required; XML-RPC itself does not offer
+  a portable safe remote-filesystem deletion API.
+- The probe does not scrape trackers directly, make copyright or licensing
+  determinations, or intentionally start a full download.
 
 ## TMDb attribution
 

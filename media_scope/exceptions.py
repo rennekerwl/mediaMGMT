@@ -138,3 +138,65 @@ class AllIndexersFailedError(JackettError):
     def __init__(self, message: str, *, diagnostics: list[dict[str, Any]]) -> None:
         super().__init__(message)
         self.diagnostics = diagnostics
+
+
+class ProbeError(MediaScopeError):
+    """Base class for expected live torrent-probe failures."""
+
+    error_code = "PROBE_ERROR"
+
+
+class ProbeInputError(ProbeError):
+    """Raised when Jackett search JSON cannot be safely probed."""
+
+    error_code = "INVALID_SEARCH_RESULTS"
+
+
+class NoProbeCandidatesError(ProbeError):
+    """Raised when valid search JSON has no candidates."""
+
+    error_code = "NO_CANDIDATES"
+
+
+class RtorrentError(ProbeError):
+    """Base class for rTorrent configuration and communication failures."""
+
+    error_code = "RTORRENT_RPC_UNAVAILABLE"
+
+
+class RtorrentConfigurationError(RtorrentError):
+    """Raised when rTorrent configuration is missing or unsafe."""
+
+    error_code = "RTORRENT_CONFIGURATION_MISSING"
+
+
+class RtorrentAuthenticationError(RtorrentError):
+    """Raised when the RPC gateway rejects configured credentials."""
+
+    error_code = "RTORRENT_AUTHENTICATION_FAILED"
+
+
+class RtorrentRpcError(RtorrentError):
+    """Raised when an XML-RPC request or response fails."""
+
+    error_code = "RTORRENT_RPC_UNAVAILABLE"
+
+
+class RtorrentRpcFault(RtorrentRpcError):
+    """Raised for a sanitized XML-RPC Fault returned by rTorrent."""
+
+    def __init__(self, message: str, *, fault_code: int | None = None) -> None:
+        super().__init__(message)
+        self.fault_code = fault_code
+
+
+class RtorrentMethodError(RtorrentError):
+    """Raised when the connected rTorrent lacks a required operation."""
+
+    error_code = "RTORRENT_METHOD_UNSUPPORTED"
+
+
+class MagnetSubmissionUnsupportedError(RtorrentMethodError):
+    """Raised when no supported RPC magnet-loading method is available."""
+
+    error_code = "MAGNET_SUBMISSION_UNSUPPORTED"
