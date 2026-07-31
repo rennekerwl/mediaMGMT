@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "result": "search_completed",
+  "media_type": "tv",
+  "scope": {
+    "tmdb_id": 66573,
+    "title": "The Good Place",
+    "expected_seasons": [1, 2, 3, 4]
+  },
+  "candidates": [
+    {
+      "rank": 2,
+      "classification": "COMPLETE_SERIES",
+      "original_title": "Example Complete Series Second",
+      "magnet_uri": "magnet:?xt=urn:btih:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "infohash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "size_bytes": 2000000000,
+      "seeders": 12,
+      "score": 90,
+      "source_indexers": ["example"]
+    },
+    {
+      "rank": 1,
+      "classification": "COMPLETE_SERIES",
+      "original_title": "Example Complete Series First",
+      "magnet_uri": "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "infohash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "size_bytes": 1000000000,
+      "seeders": 20,
+      "score": 96,
+      "source_indexers": ["example"]
+    }
+  ],
+  "warnings": []
+}
