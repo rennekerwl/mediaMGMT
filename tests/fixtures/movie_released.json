@@ -1,0 +1,19 @@
+{
+  "id": 1091,
+  "title": "The Thing",
+  "original_title": "The Thing",
+  "release_date": "1982-06-25",
+  "status": "Released",
+  "runtime": 109,
+  "original_language": "en",
+  "genres": [
+    {
+      "id": 27,
+      "name": "Horror"
+    },
+    {
+      "id": 878,
+      "name": "Science Fiction"
+    }
+  ]
+}
