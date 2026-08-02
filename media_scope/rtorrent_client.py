@@ -9,6 +9,10 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
+from media_scope.download_models import (
+    DownloadCapabilities,
+    DownloadSnapshot,
+)
 from media_scope.exceptions import (
     MagnetSubmissionUnsupportedError,
     RtorrentAuthenticationError,
@@ -27,14 +31,29 @@ _KNOWN_METHODS = frozenset(
         "system.api_version",
         "system.cwd",
         "d.name",
+        "d.hash",
+        "d.get_hash",
         "d.is_meta",
         "d.size_files",
         "d.size_bytes",
         "d.peers_connected",
         "d.peers_complete",
         "d.message",
+        "d.state",
         "d.is_active",
+        "d.is_open",
+        "d.complete",
+        "d.completed_bytes",
+        "d.left_bytes",
+        "d.down.rate",
+        "d.up.rate",
+        "d.up.total",
+        "d.base_path",
+        "d.directory",
+        "d.ratio",
+        "d.hashing",
         "d.directory.set",
+        "d.custom",
         "d.custom.set",
         "d.start",
         "d.stop",
@@ -77,6 +96,7 @@ class RtorrentClient:
             headers={"Content-Type": "text/xml", "Accept": "text/xml"},
         )
         self.capabilities: RtorrentCapabilities | None = None
+        self.download_capabilities: DownloadCapabilities | None = None
         if not verify_tls and urlsplit(self.rpc_url).scheme == "https":
             LOGGER.warning("TLS certificate verification is disabled for the rTorrent gateway.")
 
@@ -170,6 +190,55 @@ class RtorrentClient:
         )
         return self.capabilities
 
+    def discover_download_capabilities(self) -> DownloadCapabilities:
+        """Discover the read/write operations required by the Step 6 controller."""
+        methods = self._discover_methods()
+        versions: dict[str, str | None] = {}
+        for name, method in (
+            ("client", "system.client_version"),
+            ("library", "system.library_version"),
+            ("api", "system.api_version"),
+        ):
+            versions[name] = self._optional_text(method, methods)
+        hash_method = next((name for name in ("d.hash", "d.get_hash") if name in methods), None)
+        required = {
+            "d.name",
+            "d.size_bytes",
+            "d.completed_bytes",
+            "d.directory",
+            "d.base_path",
+            "d.directory.set",
+            "d.custom",
+            "d.custom.set",
+            "d.start",
+            "d.stop",
+        }
+        missing = required - methods
+        if hash_method is None:
+            missing.add("d.hash")
+        if missing:
+            joined = ", ".join(sorted(missing))
+            raise RtorrentMethodError(
+                f"Connected rTorrent lacks required download methods: {joined}."
+            )
+        if "d.is_meta" in methods:
+            detection = "d.is_meta"
+        elif "d.size_files" in methods:
+            detection = "compatibility_fallback"
+        else:
+            raise RtorrentMethodError(
+                "Connected rTorrent cannot confirm that torrent metadata is available."
+            )
+        self.download_capabilities = DownloadCapabilities(
+            client_version=versions["client"],
+            library_version=versions["library"],
+            api_version=versions["api"],
+            methods=frozenset(methods),
+            metadata_detection_method=detection,
+            hash_method=hash_method or "d.hash",
+        )
+        return self.download_capabilities
+
     def torrent_exists(self, infohash: str) -> bool:
         """Return whether a torrent hash is present without changing it."""
         try:
@@ -230,6 +299,92 @@ class RtorrentClient:
         message = self._optional_status_message(target, methods)
         return TorrentStatus(metadata_retrieved, detection, connected, complete, message)
 
+    def download_snapshot(self, infohash: str) -> DownloadSnapshot:
+        """Read a normalized full-download status snapshot without changing the item."""
+        capabilities = self._require_download_capabilities()
+        target = infohash.upper()
+        methods = capabilities.methods
+        actual_hash = str(self.call(capabilities.hash_method, target)).strip().lower()
+        name = str(self.call("d.name", target)).strip()
+        size = max(_integer(self.call("d.size_bytes", target)), 0)
+        completed = max(_integer(self.call("d.completed_bytes", target)), 0)
+        if capabilities.metadata_detection_method == "d.is_meta":
+            metadata = _integer(self.call("d.is_meta", target)) == 0
+        else:
+            files = max(_integer(self.call("d.size_files", target)), 0)
+            metadata = bool(
+                name and files > 0 and size > 0 and name.casefold() != f"{target}.meta".casefold()
+            )
+        left = self._optional_integer("d.left_bytes", target, methods)
+        if "d.left_bytes" not in methods:
+            left = max(size - completed, 0)
+        complete = bool(self._optional_integer("d.complete", target, methods))
+        if "d.complete" not in methods:
+            complete = size > 0 and completed >= size and left == 0
+        return DownloadSnapshot(
+            infohash=actual_hash,
+            name=name,
+            metadata_retrieved=metadata,
+            state=self._optional_integer("d.state", target, methods),
+            is_active=bool(self._optional_integer("d.is_active", target, methods)),
+            is_open=bool(self._optional_integer("d.is_open", target, methods)),
+            complete=complete,
+            completed_bytes=completed,
+            size_bytes=size,
+            left_bytes=left,
+            download_rate=self._optional_integer("d.down.rate", target, methods),
+            upload_rate=self._optional_integer("d.up.rate", target, methods),
+            uploaded_bytes=self._optional_integer("d.up.total", target, methods),
+            connected_peers=self._optional_integer("d.peers_connected", target, methods),
+            complete_peers=self._optional_integer("d.peers_complete", target, methods),
+            message=self._optional_status_message(target, methods),
+            base_path=str(self.call("d.base_path", target)).strip(),
+            directory=str(self.call("d.directory", target)).strip(),
+            ratio=self._optional_integer("d.ratio", target, methods),
+            hashing=bool(self._optional_integer("d.hashing", target, methods)),
+        )
+
+    def set_download_directory(self, infohash: str, directory: Path) -> None:
+        """Register one already-validated permanent directory on an existing item."""
+        value = str(directory)
+        if any(character in value for character in ("\x00", "\n", "\r", ",")):
+            raise RtorrentConfigurationError("Permanent download directory is unsafe for RPC.")
+        self.call("d.directory.set", infohash.upper(), value)
+
+    def tag_download(
+        self,
+        infohash: str,
+        *,
+        job_id: str,
+        state: str,
+        source: str,
+        tmdb_id: int | str,
+    ) -> None:
+        """Set only Step 6's named custom fields, leaving all other fields untouched."""
+        target = infohash.upper()
+        values = {
+            "media_download_job_id": job_id,
+            "media_download_state": state,
+            "media_download_source": source,
+            "media_download_tmdb_id": str(tmdb_id),
+        }
+        for name, value in values.items():
+            self.call("d.custom.set", target, name, value)
+
+    def set_download_state(self, infohash: str, state: str) -> None:
+        """Update only Step 6's named state field."""
+        self.call("d.custom.set", infohash.upper(), "media_download_state", state)
+
+    def get_custom(self, infohash: str, name: str) -> str | None:
+        """Read one named custom field without touching legacy custom slots."""
+        value = self.call("d.custom", infohash.upper(), name)
+        text = str(value or "").strip()
+        return text or None
+
+    def start(self, infohash: str) -> None:
+        """Start or resume one existing torrent."""
+        self.call("d.start", infohash.upper())
+
     def stop(self, infohash: str) -> None:
         """Stop one torrent."""
         self.call("d.stop", infohash.upper())
@@ -278,13 +433,18 @@ class RtorrentClient:
             value = self.call("d.message", target)
         except RtorrentRpcFault:
             return None
-        text = re.sub(r"[\x00-\x1f\x7f]", " ", str(value or "")).strip()
+        text = _sanitize_untrusted_message(str(value or ""))
         return text[:500] or None
 
     def _require_capabilities(self) -> RtorrentCapabilities:
         if self.capabilities is None:
             raise RtorrentMethodError("rTorrent capabilities have not been discovered.")
         return self.capabilities
+
+    def _require_download_capabilities(self) -> DownloadCapabilities:
+        if self.download_capabilities is None:
+            raise RtorrentMethodError("rTorrent download capabilities have not been discovered.")
+        return self.download_capabilities
 
 
 def sanitize_rpc_endpoint(value: str) -> str:
@@ -315,12 +475,17 @@ def _validate_rpc_url(value: str) -> str:
 
 
 def _sanitize_fault(value: str) -> str:
-    text = re.sub(r"[\x00-\x1f\x7f]", " ", value).strip()
+    text = _sanitize_untrusted_message(value)
     return (
         f"rTorrent returned an XML-RPC fault: {text[:300]}"
         if text
         else ("rTorrent returned an XML-RPC fault.")
     )
+
+
+def _sanitize_untrusted_message(value: str) -> str:
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", value).strip()
+    return re.sub(r"\b[a-z][a-z0-9+.-]*://\S+", "[redacted-url]", text, flags=re.IGNORECASE)
 
 
 def _integer(value: object) -> int:

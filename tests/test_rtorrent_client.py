@@ -36,6 +36,37 @@ REQUIRED = {
     "execute.throw",
 }
 
+DOWNLOAD_REQUIRED = {
+    "system.client_version",
+    "system.library_version",
+    "system.api_version",
+    "d.name",
+    "d.hash",
+    "d.is_meta",
+    "d.size_bytes",
+    "d.completed_bytes",
+    "d.directory",
+    "d.base_path",
+    "d.directory.set",
+    "d.custom",
+    "d.custom.set",
+    "d.start",
+    "d.stop",
+    "d.state",
+    "d.is_active",
+    "d.is_open",
+    "d.complete",
+    "d.left_bytes",
+    "d.down.rate",
+    "d.up.rate",
+    "d.up.total",
+    "d.peers_connected",
+    "d.peers_complete",
+    "d.message",
+    "d.ratio",
+    "d.hashing",
+}
+
 
 def xml_response(value: object) -> bytes:
     return xmlrpc.client.dumps((value,), methodresponse=True, allow_none=True).encode()
@@ -215,3 +246,93 @@ def test_submit_magnet_preserves_posix_directory_path() -> None:
 def test_endpoint_sanitization_removes_query_fragment_and_userinfo() -> None:
     value = sanitize_rpc_endpoint("https://user:pass@example.test:443/path?token=x#fragment")
     assert value == "https://example.test:443/path"
+
+
+def test_download_snapshot_and_named_fields_use_no_legacy_custom_slot(tmp_path: Path) -> None:
+    captured: list[tuple[str, tuple[object, ...]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        params, method = xmlrpc.client.loads(request.content)
+        captured.append((method or "", params))
+        values: dict[str, object] = {
+            "system.listMethods": sorted(DOWNLOAD_REQUIRED),
+            "system.client_version": "0.9.8",
+            "system.library_version": "0.13.8",
+            "system.api_version": "9",
+            "d.name": "Example",
+            "d.hash": "A" * 40,
+            "d.is_meta": 0,
+            "d.size_bytes": 100,
+            "d.completed_bytes": 40,
+            "d.directory": str(tmp_path),
+            "d.base_path": str(tmp_path / "Example"),
+            "d.state": 1,
+            "d.is_active": 1,
+            "d.is_open": 1,
+            "d.complete": 0,
+            "d.left_bytes": 60,
+            "d.down.rate": 25,
+            "d.up.rate": 5,
+            "d.up.total": 10,
+            "d.peers_connected": 3,
+            "d.peers_complete": 2,
+            "d.message": "",
+            "d.ratio": 100,
+            "d.hashing": 0,
+            "d.custom": "",
+        }
+        return httpx.Response(200, content=xml_response(values.get(method or "", 0)))
+
+    with RtorrentClient("http://localhost/RPC", transport=httpx.MockTransport(handler)) as client:
+        capabilities = client.discover_download_capabilities()
+        status = client.download_snapshot("a" * 40)
+        client.tag_download(
+            "a" * 40,
+            job_id="download-1-aaaaaaaaaaaa",
+            state="STARTING",
+            source="probe-1",
+            tmdb_id=1,
+        )
+    assert capabilities.hash_method == "d.hash"
+    assert status.completed_bytes == 40
+    assert status.left_bytes == 60
+    custom_names = [params[1] for method, params in captured if method == "d.custom.set"]
+    assert custom_names == [
+        "media_download_job_id",
+        "media_download_state",
+        "media_download_source",
+        "media_download_tmdb_id",
+    ]
+    assert not any(method == "d.custom1" for method, _params in captured)
+
+
+def test_download_capabilities_do_not_require_magnet_load_methods() -> None:
+    with RtorrentClient(
+        "http://localhost/RPC", transport=rpc_transport(DOWNLOAD_REQUIRED)
+    ) as client:
+        capabilities = client.discover_download_capabilities()
+    assert capabilities.hash_method == "d.hash"
+    assert not any(name.startswith("load.") for name in capabilities.methods)
+
+
+def test_status_messages_redact_embedded_urls() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        _params, method = xmlrpc.client.loads(request.content)
+        values: dict[str, object] = {
+            "system.listMethods": sorted(REQUIRED),
+            "system.client_version": "0.9.8",
+            "system.library_version": "0.13.8",
+            "system.api_version": "9",
+            "d.name": "Example",
+            "d.is_meta": 0,
+            "d.peers_connected": 0,
+            "d.peers_complete": 0,
+            "d.message": "Tracker https://user:secret@example.test/a?passkey=secret failed",
+        }
+        return httpx.Response(200, content=xml_response(values.get(method or "", 0)))
+
+    with RtorrentClient("http://localhost/RPC", transport=httpx.MockTransport(handler)) as client:
+        client.discover_capabilities()
+        status = client.status("a" * 40)
+    assert status.message == "Tracker [redacted-url] failed"
+    assert "secret" not in status.message

@@ -206,3 +206,31 @@ class MagnetSubmissionUnsupportedError(RtorrentMethodError):
     """Raised when no supported RPC magnet-loading method is available."""
 
     error_code = "MAGNET_SUBMISSION_UNSUPPORTED"
+
+
+class DownloadError(MediaScopeError):
+    """Base class for expected full-download failures."""
+
+    error_code = "DOWNLOAD_FAILED"
+    exit_code = 9
+
+
+class DownloadInputError(DownloadError):
+    """Raised when a Step 5 handoff is malformed or inconsistent."""
+
+    error_code = "INVALID_HEALTH_RESULT"
+    exit_code = 2
+
+
+class DownloadStorageError(DownloadError):
+    """Raised for unsafe paths, collisions, and storage-capacity failures."""
+
+    error_code = "UNSAFE_DOWNLOAD_ROOT"
+    exit_code = 5
+
+
+class DownloadPostProcessingError(DownloadError):
+    """Raised when completed payload paths cannot be safely handed to Step 7."""
+
+    error_code = "POST_PROCESSING_FAILED"
+    exit_code = 8

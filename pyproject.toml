@@ -23,6 +23,7 @@ dev = [
 media-scope = "media_scope.cli:main"
 media-search-tv = "media_scope.search_cli:main"
 media-probe-torrents = "media_scope.probe_cli:main"
+media-download-torrent = "media_scope.download_cli:main"
 
 [tool.setuptools.packages.find]
 include = ["media_scope*"]
