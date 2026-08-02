@@ -78,7 +78,7 @@ def test_missing_rtorrent_configuration_is_exit_four(
     monkeypatch: Any,
 ) -> None:
     path = write_report(tmp_path / "search.json", candidate(1))
-    monkeypatch.delenv("RTORRENT_RPC_URL", raising=False)
+    monkeypatch.setenv("RTORRENT_RPC_URL", "")
     code = main(["--search-results", str(path)])
     payload = json.loads(capsys.readouterr().out)
     assert code == 4
@@ -99,9 +99,8 @@ def test_mocked_probe_rank_one_fails_and_rank_two_succeeds(
     monkeypatch: Any,
 ) -> None:
     path = write_report(tmp_path / "search.json", candidate(1), candidate(2, HASH_B))
-    probe_root = (tmp_path / "probes").resolve()
     monkeypatch.setenv("RTORRENT_RPC_URL", "http://rtorrent.test/RPC")
-    monkeypatch.setenv("RTORRENT_PROBE_DIRECTORY", str(probe_root))
+    monkeypatch.setenv("RTORRENT_PROBE_DIRECTORY", "/remote/home/probes")
     client = CliFakeRtorrent({HASH_B: [metadata(True)]})
     client.fail_submission.add(HASH_A.upper())
 
@@ -126,6 +125,7 @@ def test_mocked_probe_rank_one_fails_and_rank_two_succeeds(
 
 def test_connection_diagnostic_adds_no_torrent(capsys: Any, monkeypatch: Any) -> None:
     monkeypatch.setenv("RTORRENT_RPC_URL", "http://rtorrent.test/RPC")
+    monkeypatch.setenv("RTORRENT_PROBE_DIRECTORY", "/remote/home/probes")
     client = CliFakeRtorrent({})
 
     def factory(*_args: Any, **_kwargs: Any) -> CliFakeRtorrent:
@@ -135,6 +135,7 @@ def test_connection_diagnostic_adds_no_torrent(capsys: Any, monkeypatch: Any) ->
     payload = json.loads(capsys.readouterr().out)
     assert code == 0
     assert payload["result"] == "connection_ok"
+    assert payload["probe_directory_ready"] is True
     assert payload["torrent_added"] is False
     assert not any(call[0] == "submit" for call in client.calls)
 

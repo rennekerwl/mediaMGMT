@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import xmlrpc.client
-from pathlib import Path
 
 import httpx
 import pytest
@@ -21,6 +20,7 @@ REQUIRED = {
     "system.client_version",
     "system.library_version",
     "system.api_version",
+    "system.cwd",
     "d.name",
     "d.is_meta",
     "d.directory.set",
@@ -31,6 +31,9 @@ REQUIRED = {
     "d.peers_connected",
     "d.peers_complete",
     "d.message",
+    "d.is_active",
+    "execute.capture",
+    "execute.throw",
 }
 
 
@@ -56,12 +59,16 @@ def rpc_transport(
         }
         if method in versions:
             return httpx.Response(200, content=xml_response(versions[method]))
+        if method == "system.cwd":
+            return httpx.Response(200, content=xml_response("/srv/rtorrent"))
         if method == "d.name":
             return httpx.Response(200, content=xml_response("Example"))
         if method == "d.is_meta":
             return httpx.Response(200, content=xml_response(0))
         if method in {"d.peers_connected", "d.peers_complete"}:
             return httpx.Response(200, content=xml_response(2))
+        if method == "d.is_active":
+            return httpx.Response(200, content=xml_response(1))
         if method == "d.message":
             return httpx.Response(200, content=xml_response(""))
         return httpx.Response(200, content=xml_response(0))
@@ -173,7 +180,7 @@ def test_compatibility_fallback_rejects_rtorrent_meta_placeholder() -> None:
     assert status.detection_method == "compatibility_fallback"
 
 
-def test_normal_load_compatibility_path_starts_torrent_after_loading(tmp_path: Path) -> None:
+def test_normal_load_compatibility_path_starts_torrent_after_loading() -> None:
     captured: list[httpx.Request] = []
     methods = (REQUIRED - {"load.start_verbose"}) | {"load.normal_verbose", "d.start"}
     with RtorrentClient(
@@ -184,12 +191,25 @@ def test_normal_load_compatibility_path_starts_torrent_after_loading(tmp_path: P
         selected = client.submit_magnet(
             f"magnet:?xt=urn:btih:{'a' * 40}",
             "a" * 40,
-            tmp_path,
+            "/srv/rtorrent/media-probes/probe-test/hash",
         )
     called = [xmlrpc.client.loads(request.content)[1] for request in captured]
     assert capabilities.load_starts is False
     assert selected == "load.normal_verbose"
     assert called[-2:] == ["load.normal_verbose", "d.start"]
+
+
+def test_submit_magnet_preserves_posix_directory_path() -> None:
+    captured: list[httpx.Request] = []
+    directory = "/home/seedboxer1/media-probes/probe-test/hash"
+    with RtorrentClient(
+        "http://localhost/RPC",
+        transport=rpc_transport(captured=captured),
+    ) as client:
+        client.discover_capabilities()
+        client.submit_magnet(f"magnet:?xt=urn:btih:{'a' * 40}", "a" * 40, directory)
+    params, _method = xmlrpc.client.loads(captured[-1].content)
+    assert params[-1] == f"d.directory.set={directory}"
 
 
 def test_endpoint_sanitization_removes_query_fragment_and_userinfo() -> None:

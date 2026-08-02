@@ -131,16 +131,9 @@ def main(
                     keep_failed_probes=args.keep_failed_probes,
                 )
                 client = _create_client(client_factory, transport)
-                root_text = os.getenv("RTORRENT_PROBE_DIRECTORY", "").strip()
-                if not root_text:
-                    from media_scope.exceptions import RtorrentConfigurationError
-
-                    raise RtorrentConfigurationError(
-                        "RTORRENT_PROBE_DIRECTORY is missing; configure a dedicated absolute path."
-                    )
-                directories = ProbeDirectoryManager(Path(root_text), job_id)
                 LOGGER.info("Starting probe job %s against %s.", job_id, client.sanitized_endpoint)
                 with client:
+                    directories = _create_directories(client, job_id)
                     payload, exit_code = TorrentProbeService(
                         client,
                         directories,
@@ -155,6 +148,8 @@ def main(
             client = _create_client(client_factory, transport)
             with client:
                 capabilities = client.discover_capabilities()
+                directories = _create_directories(client, job_id)
+                directories.check_root()
             payload = {
                 "schema_version": 1,
                 "result": "connection_ok",
@@ -167,6 +162,7 @@ def main(
                     "metadata_detection_method": capabilities.metadata_detection_method,
                     "available_required_methods": sorted(capabilities.methods),
                 },
+                "probe_directory_ready": True,
                 "torrent_added": False,
                 "warnings": [],
             }
@@ -207,6 +203,17 @@ def _create_client(
         timeout_seconds=timeout,
         transport=transport,
     )
+
+
+def _create_directories(client: RtorrentClient, job_id: str) -> ProbeDirectoryManager:
+    root = os.getenv("RTORRENT_PROBE_DIRECTORY", "").strip()
+    if not root:
+        from media_scope.exceptions import RtorrentConfigurationError
+
+        raise RtorrentConfigurationError(
+            "RTORRENT_PROBE_DIRECTORY is missing; configure a dedicated seedbox path."
+        )
+    return ProbeDirectoryManager(client, root, job_id)
 
 
 def _dry_run_payload(

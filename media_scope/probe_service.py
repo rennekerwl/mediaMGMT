@@ -7,7 +7,6 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
 
 from media_scope.exceptions import (
     RtorrentConfigurationError,
@@ -172,7 +171,7 @@ class TorrentProbeService:
         target = candidate.infohash.upper()
         record.rtorrent_hash = target
         created = False
-        directory: Path | None = None
+        directory: str | None = None
         try:
             record.preexisting = self.client.torrent_exists(candidate.infohash)
             if not record.preexisting:
@@ -194,7 +193,13 @@ class TorrentProbeService:
                     state="waiting_for_metadata",
                     rank=candidate.rank,
                 )
-            record.transition(ProbeState.WAITING_FOR_METADATA, self._timestamp())
+                record.transition(ProbeState.WAITING_FOR_METADATA, self._timestamp())
+                if not self._confirm_activation(candidate.infohash, record):
+                    record.status = "TORRENT_NOT_ACTIVE"
+                    record.transition(ProbeState.TORRENT_NOT_ACTIVE, self._timestamp())
+                    return self._finish_failure(record, started, created, directory)
+            if record.status != ProbeState.WAITING_FOR_METADATA:
+                record.transition(ProbeState.WAITING_FOR_METADATA, self._timestamp())
             outcome = self._wait_for_metadata(
                 candidate.infohash, self.policy.metadata_timeout_seconds
             )
@@ -322,12 +327,26 @@ class TorrentProbeService:
                 return True
         return False
 
+    def _confirm_activation(self, infohash: str, record: AttemptRecord | None = None) -> bool:
+        """Require activity (or already-complete metadata) shortly after submission."""
+        deadline = self.monotonic() + min(10, self.policy.metadata_timeout_seconds)
+        while self.monotonic() < deadline:
+            status = self.client.status(infohash)
+            if record is not None:
+                record.last_rtorrent_message = status.message or record.last_rtorrent_message
+            if status.metadata_retrieved or self.client.is_active(infohash):
+                if record is not None:
+                    record.activation_confirmed = True
+                return True
+            self.sleep(min(0.25, deadline - self.monotonic()))
+        return False
+
     def _finish_failure(
         self,
         record: AttemptRecord,
         started: float,
         created: bool,
-        directory: Path | None,
+        directory: str | None,
     ) -> AttemptRecord:
         outcome = record.status
         if created:
@@ -339,7 +358,7 @@ class TorrentProbeService:
         record.finished_at = self._timestamp()
         return record
 
-    def _cleanup_owned(self, record: AttemptRecord, directory: Path | None) -> None:
+    def _cleanup_owned(self, record: AttemptRecord, directory: str | None) -> None:
         if self.policy.keep_failed_probes:
             record.cleanup_status = "SKIPPED_KEEP_FAILED_PROBES"
             record.warnings.append(
@@ -362,7 +381,7 @@ class TorrentProbeService:
         try:
             if directory is not None:
                 self.directories.cleanup_candidate(directory)
-        except (OSError, RtorrentConfigurationError) as exc:
+        except RtorrentConfigurationError as exc:
             errors.append(f"probe-directory cleanup failed: {exc}")
         record.cleanup_performed = not errors
         if errors:
@@ -394,7 +413,7 @@ class TorrentProbeService:
             raise RtorrentConfigurationError("RTORRENT_PREFLIGHT_MAGNET is invalid.") from exc
         started = self.monotonic()
         preexisting = self.client.torrent_exists(validated.infohash)
-        directory: Path | None = None
+        directory: str | None = None
         created = False
         outcome_status = "FAILED"
         detail = "Known-good preflight metadata was not retrieved."
@@ -422,6 +441,13 @@ class TorrentProbeService:
                     state="preflight",
                     rank="preflight",
                 )
+                if not self._confirm_activation(validated.infohash):
+                    detail = "Known-good preflight torrent did not become active."
+                    return {
+                        "status": "FAILED",
+                        "elapsed_seconds": round(self.monotonic() - started, 3),
+                        "message": detail,
+                    }
             outcome = self._wait_for_metadata(
                 validated.infohash,
                 self.policy.preflight_timeout_seconds,
@@ -441,7 +467,7 @@ class TorrentProbeService:
                         self.client.erase(validated.infohash)
                     if directory is not None:
                         self.directories.cleanup_candidate(directory)
-                except (RtorrentError, OSError, RtorrentConfigurationError) as exc:
+                except RtorrentError as exc:
                     self.cleanup_failed = True
                     warnings.append(f"Preflight cleanup failed: {exc}")
         return {

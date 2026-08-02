@@ -170,6 +170,12 @@ class RtorrentConfigurationError(RtorrentError):
     error_code = "RTORRENT_CONFIGURATION_MISSING"
 
 
+class RtorrentProbeDirectoryError(RtorrentConfigurationError):
+    """Raised when the dedicated probe directory is unavailable on rTorrent's host."""
+
+    error_code = "RTORRENT_PROBE_DIRECTORY_UNAVAILABLE"
+
+
 class RtorrentAuthenticationError(RtorrentError):
     """Raised when the RPC gateway rejects configured credentials."""
 

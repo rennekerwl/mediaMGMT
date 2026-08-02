@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import re
 import xmlrpc.client
-from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -26,6 +25,7 @@ _KNOWN_METHODS = frozenset(
         "system.client_version",
         "system.library_version",
         "system.api_version",
+        "system.cwd",
         "d.name",
         "d.is_meta",
         "d.size_files",
@@ -33,11 +33,14 @@ _KNOWN_METHODS = frozenset(
         "d.peers_connected",
         "d.peers_complete",
         "d.message",
+        "d.is_active",
         "d.directory.set",
         "d.custom.set",
         "d.start",
         "d.stop",
         "d.erase",
+        "execute.capture",
+        "execute.throw",
         "load.start_verbose",
         "load.start",
         "load.normal_verbose",
@@ -124,7 +127,17 @@ class RtorrentClient:
         ):
             versions[name] = self._optional_text(method, methods)
 
-        missing = {"d.name", "d.directory.set", "d.custom.set", "d.stop", "d.erase"} - methods
+        missing = {
+            "d.name",
+            "d.directory.set",
+            "d.custom.set",
+            "d.stop",
+            "d.erase",
+            "d.is_active",
+            "execute.capture",
+            "execute.throw",
+            "system.cwd",
+        } - methods
         if missing:
             joined = ", ".join(sorted(missing))
             raise RtorrentMethodError(f"Connected rTorrent lacks required methods: {joined}.")
@@ -165,19 +178,23 @@ class RtorrentClient:
             return False
         return True
 
-    def submit_magnet(self, magnet_uri: str, infohash: str, directory: Path) -> str:
+    def submit_magnet(self, magnet_uri: str, infohash: str, directory: str) -> str:
         """Load and start a magnet using the discovered compatible method."""
         capabilities = self._require_capabilities()
         method = capabilities.load_method
         if method is None:
             raise MagnetSubmissionUnsupportedError("No compatible magnet load method was selected.")
-        directory_value = str(directory)
+        directory_value = directory
         if any(value in directory_value for value in ("\n", "\r", ",")):
             raise RtorrentConfigurationError("Probe directory contains an unsafe character.")
         self.call(method, "", magnet_uri, f"d.directory.set={directory_value}")
         if not capabilities.load_starts:
             self.call("d.start", infohash.upper())
         return method
+
+    def is_active(self, infohash: str) -> bool:
+        """Return whether rTorrent is actively running this torrent."""
+        return _integer(self.call("d.is_active", infohash.upper())) != 0
 
     def tag_probe(self, infohash: str, *, job_id: str, state: str, rank: int | str) -> None:
         """Apply named ownership fields to a newly created probe torrent."""

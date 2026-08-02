@@ -287,7 +287,9 @@ cannot make an incomplete result acceptable.
 `media-probe-torrents` is a live swarm-health gate after the title-based Jackett
 ranking. It processes accepted candidates in ascending original rank, temporarily
 starts each magnet, and selects the first one for which rTorrent retrieves BitTorrent
-metadata before the deadline. That is the complete MVP health rule.
+metadata before the deadline. A newly submitted magnet must also become active within
+ten seconds; an inactive torrent fails as `TORRENT_NOT_ACTIVE` rather than consuming
+the metadata timeout. That is the complete MVP health rule.
 
 The indexer's `seeders` value remains in the report as historical source metadata. It
 is not added to, equated with, or substituted for rTorrent's live connected-peer
@@ -336,7 +338,14 @@ automates ruTorrent in a browser. Metadata detection prefers `d.is_meta == 0`. O
 instances may use the explicitly reported `compatibility_fallback` based on regular
 torrent size/file-count fields.
 
-Check authentication, versions, and required methods without adding a torrent:
+Step 5 runs from the desktop but manages its temporary folders on the seedbox through
+the same secured XML-RPC gateway. The gateway must expose `execute.capture` and
+`execute.throw`, in addition to the normal torrent methods. The program invokes fixed
+`mkdir`, `realpath`, `stat`, `test`, `rm`, and `rmdir` executables with separately
+validated arguments; it never sends a shell command string.
+
+Check authentication, versions, required methods, and seedbox probe-directory access
+without adding a torrent:
 
 ```powershell
 python -m media_scope.probe_torrents check-connection --pretty
@@ -344,9 +353,11 @@ python -m media_scope.probe_torrents check-connection --pretty
 
 ### Probe-directory safety
 
-`RTORRENT_PROBE_DIRECTORY` must be an absolute, dedicated path visible to the process
-and to rTorrent. It must not be `/`, a filesystem root, a home directory, or the normal
-completed-download directory. Each command creates an owner-only directory such as:
+`RTORRENT_PROBE_DIRECTORY` must be an absolute, dedicated POSIX path on the
+rTorrent/seedbox host. It must already exist, be writable by rTorrent, and must not be
+`/`, a filesystem root, a home directory, or the normal completed-download directory.
+It does not need to be visible to the Windows desktop. Each command creates an
+owner-only seedbox directory such as:
 
 ```text
 /srv/rtorrent/media-probes/probe-20260731T120000Z-a1b2c3d4/<infohash>/
@@ -354,10 +365,10 @@ completed-download directory. Each command creates an owner-only directory such 
 
 Release titles are never used as path components. Failed, script-created torrents are
 stopped and erased from rTorrent, then only their verified infohash child directory is
-removed. rTorrent erase is not assumed to delete data. Preexisting torrents and their
-files are never stopped, retagged, redirected, or erased. The shared probe root is
-never removed. `--keep-failed-probes` intentionally disables failed-probe cleanup for
-debugging and is dangerous.
+removed through the RPC gateway. rTorrent erase is not assumed to delete data.
+Preexisting torrents and their files are never stopped, retagged, redirected, or
+erased. The shared probe root is never removed. `--keep-failed-probes` intentionally
+disables failed-probe cleanup for debugging and is dangerous.
 
 ### Optional infrastructure preflight
 
@@ -455,6 +466,9 @@ fails, the result is `NO_HEALTHY_TORRENT_FOUND` and exit code 6.
   DNS, outbound tracker access, DHT/UDP connectivity where applicable, and firewall
   rules. A configured known-good preflight separates infrastructure failure from a
   candidate-specific timeout.
+- **Torrent not active:** the seedbox could not start the submitted magnet. Run
+  `check-connection`, then confirm the configured remote probe directory exists and is
+  writable by rTorrent.
 - **Preflight failure:** fix the rTorrent host's network, tracker, DHT, proxy, or
   gateway configuration before retrying candidates. Candidates are not blamed.
 - **Unsupported magnet submission:** inspect the `check-connection` method report and
@@ -581,8 +595,8 @@ magnet.
   are rejected or classified `UNKNOWN`.
 - The live gate proves only timely metadata retrieval. It does not verify files,
   seasons, episodes, payload availability, legal status, or eventual completion.
-- A locally accessible probe-directory path is required; XML-RPC itself does not offer
-  a portable safe remote-filesystem deletion API.
+- The rTorrent XML-RPC gateway must permit the fixed remote directory-management
+  commands required by Step 5.
 - The probe does not scrape trackers directly, make copyright or licensing
   determinations, or intentionally start a full download.
 

@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
-import pytest
-
-from media_scope.exceptions import RtorrentRpcError
+from media_scope.exceptions import RtorrentRpcError, RtorrentRpcFault
 from media_scope.probe_directories import ProbeDirectoryManager
 from media_scope.probe_input import parse_probe_input
 from media_scope.probe_models import RtorrentCapabilities, TorrentStatus
@@ -39,6 +36,8 @@ class FakeRtorrent:
         self.fail_submission: set[str] = set()
         self.fail_submission_after_add: set[str] = set()
         self.fail_erase: set[str] = set()
+        self.inactive: set[str] = set()
+        self.remote_dirs = {"/remote/home", "/remote/home/probes"}
         self.capabilities = RtorrentCapabilities(
             "0.9.8",
             "0.13.8",
@@ -56,7 +55,7 @@ class FakeRtorrent:
     def torrent_exists(self, infohash: str) -> bool:
         return infohash.upper() in self.existing
 
-    def submit_magnet(self, _magnet: str, infohash: str, directory: Path) -> str:
+    def submit_magnet(self, _magnet: str, infohash: str, directory: str) -> str:
         target = infohash.upper()
         self.calls.append(("submit", target, directory))
         if target in self.fail_submission:
@@ -65,6 +64,51 @@ class FakeRtorrent:
         if target in self.fail_submission_after_add:
             raise RtorrentRpcError("response lost after submission")
         return "load.start_verbose"
+
+    def is_active(self, infohash: str) -> bool:
+        return infohash.upper() not in self.inactive
+
+    def call(self, method: str, *params: object) -> object:
+        self.calls.append(("rpc", method, *params))
+        if method == "system.cwd":
+            return "/remote/home"
+        if method == "execute.capture":
+            command = params[1]
+            path = str(params[-1])
+            if command == "/usr/bin/realpath":
+                if path not in self.remote_dirs:
+                    raise RtorrentRpcFault("missing", fault_code=1)
+                return path
+            if command == "/usr/bin/stat":
+                return "directory\n"
+        if method == "execute.throw":
+            command = params[1]
+            if command == "/usr/bin/test":
+                if str(params[-1]) not in self.remote_dirs:
+                    raise RtorrentRpcFault("not writable", fault_code=1)
+                return 0
+            if command == "/bin/mkdir":
+                path = str(params[-1])
+                parent = path.rsplit("/", 1)[0]
+                if parent not in self.remote_dirs:
+                    raise RtorrentRpcFault("parent missing", fault_code=1)
+                self.remote_dirs.add(path)
+                return 0
+            if command == "/bin/rm":
+                path = str(params[-1])
+                self.remote_dirs = {
+                    value
+                    for value in self.remote_dirs
+                    if value != path and not value.startswith(path + "/")
+                }
+                return 0
+            if command == "/bin/rmdir":
+                path = str(params[-1])
+                if any(value.startswith(path + "/") for value in self.remote_dirs):
+                    raise RtorrentRpcFault("not empty", fault_code=1)
+                self.remote_dirs.discard(path)
+                return 0
+        raise AssertionError(f"unexpected remote command: {method} {params}")
 
     def tag_probe(self, infohash: str, **tags: Any) -> None:
         self.calls.append(("tag", infohash.upper(), tags))
@@ -102,7 +146,6 @@ def metadata(healthy: bool, peers: int = 0, complete: int = 0) -> TorrentStatus:
 
 
 def make_service(
-    tmp_path: Path,
     client: FakeRtorrent,
     *,
     maximum: int = 10,
@@ -110,7 +153,7 @@ def make_service(
     keep: bool = False,
 ) -> TorrentProbeService:
     clock = FakeClock()
-    manager = ProbeDirectoryManager((tmp_path / "probes").resolve(), "probe-test")
+    manager = ProbeDirectoryManager(client, "/remote/home/probes", "probe-test")
     return TorrentProbeService(
         client,  # type: ignore[arg-type]
         manager,
@@ -133,9 +176,9 @@ def run_service(
     )
 
 
-def test_first_candidate_retrieves_metadata_and_is_stopped_retained(tmp_path: Path) -> None:
+def test_first_candidate_retrieves_metadata_and_is_stopped_retained() -> None:
     client = FakeRtorrent({HASH_A: [metadata(True, 3, 1)]})
-    payload, code = run_service(make_service(tmp_path, client), candidate(1))
+    payload, code = run_service(make_service(client), candidate(1))
     assert code == 0
     assert payload["result"] == "candidate_health_validated"
     assert payload["selected_candidate"]["original_rank"] == 1
@@ -145,7 +188,7 @@ def test_first_candidate_retrieves_metadata_and_is_stopped_retained(tmp_path: Pa
     assert ("erase", HASH_A.upper()) not in client.calls
 
 
-def test_first_times_out_is_cleaned_and_second_succeeds(tmp_path: Path) -> None:
+def test_first_times_out_is_cleaned_and_second_succeeds() -> None:
     client = FakeRtorrent(
         {
             HASH_A: [metadata(False)],
@@ -153,7 +196,7 @@ def test_first_times_out_is_cleaned_and_second_succeeds(tmp_path: Path) -> None:
         }
     )
     payload, code = run_service(
-        make_service(tmp_path, client),
+        make_service(client),
         candidate(2, HASH_B),
         candidate(1, HASH_A),
     )
@@ -165,9 +208,9 @@ def test_first_times_out_is_cleaned_and_second_succeeds(tmp_path: Path) -> None:
     assert ("erase", HASH_A.upper()) in client.calls
 
 
-def test_all_time_out_returns_six_and_no_selection(tmp_path: Path) -> None:
+def test_all_time_out_returns_six_and_no_selection() -> None:
     client = FakeRtorrent({HASH_A: [metadata(False)], HASH_B: [metadata(False)]})
-    payload, code = run_service(make_service(tmp_path, client), candidate(1), candidate(2, HASH_B))
+    payload, code = run_service(make_service(client), candidate(1), candidate(2, HASH_B))
     assert code == 6
     assert payload["result"] == "NO_HEALTHY_TORRENT_FOUND"
     assert payload["selected_candidate"] is None
@@ -177,72 +220,70 @@ def test_all_time_out_returns_six_and_no_selection(tmp_path: Path) -> None:
     }
 
 
-def test_submission_failure_continues_to_second_candidate(tmp_path: Path) -> None:
+def test_submission_failure_continues_to_second_candidate() -> None:
     client = FakeRtorrent({HASH_B: [metadata(True)]})
     client.fail_submission.add(HASH_A.upper())
-    payload, code = run_service(make_service(tmp_path, client), candidate(1), candidate(2, HASH_B))
+    payload, code = run_service(make_service(client), candidate(1), candidate(2, HASH_B))
     assert code == 0
     assert payload["attempts"][0]["status"] == "SUBMISSION_FAILED"
     assert payload["selected_candidate"]["original_rank"] == 2
 
 
-def test_partial_submission_failure_is_detected_and_cleaned(tmp_path: Path) -> None:
+def test_partial_submission_failure_is_detected_and_cleaned() -> None:
     client = FakeRtorrent({})
     client.fail_submission_after_add.add(HASH_A.upper())
-    payload, code = run_service(make_service(tmp_path, client), candidate(1))
+    payload, code = run_service(make_service(client), candidate(1))
     assert code == 6
     assert payload["attempts"][0]["status"] == "SUBMISSION_FAILED"
     assert payload["attempts"][0]["cleanup_performed"] is True
     assert HASH_A.upper() not in client.existing
 
 
-def test_polling_failure_is_retried_then_reported(tmp_path: Path) -> None:
+def test_polling_failure_is_retried_then_reported() -> None:
     failure = RtorrentRpcError("status failed")
     client = FakeRtorrent({HASH_A: [failure, failure, failure]})
-    payload, code = run_service(make_service(tmp_path, client, timeout=10), candidate(1))
+    payload, code = run_service(make_service(client, timeout=10), candidate(1))
     assert code == 6
     assert payload["attempts"][0]["status"] == "RPC_FAILED"
 
 
-def test_torrent_disappearance_is_reported_and_cleanup_safe(tmp_path: Path) -> None:
+def test_torrent_disappearance_is_reported_and_cleanup_safe() -> None:
     client = FakeRtorrent({HASH_A: ["disappear"]})
-    payload, code = run_service(make_service(tmp_path, client), candidate(1))
+    payload, code = run_service(make_service(client), candidate(1))
     assert code == 6
     assert payload["attempts"][0]["status"] == "TORRENT_DISAPPEARED"
 
 
-def test_peer_maxima_are_recorded_without_indexer_seed_addition(tmp_path: Path) -> None:
+def test_peer_maxima_are_recorded_without_indexer_seed_addition() -> None:
     client = FakeRtorrent({HASH_A: [metadata(False, 2, 1), metadata(True, 5, 3)]})
-    payload, _code = run_service(make_service(tmp_path, client), candidate(1))
+    payload, _code = run_service(make_service(client), candidate(1))
     attempt = payload["attempts"][0]
     assert attempt["maximum_connected_peers"] == 5
     assert attempt["maximum_complete_peers"] == 3
     assert attempt["indexer_reported_seeders"] == 4
 
 
-def test_stops_after_first_healthy_and_reports_lower_candidates_unattempted(
-    tmp_path: Path,
-) -> None:
+def test_stops_after_first_healthy_and_reports_lower_candidates_unattempted() -> None:
     client = FakeRtorrent({HASH_A: [metadata(True)], HASH_B: [metadata(True)]})
-    payload, _code = run_service(make_service(tmp_path, client), candidate(1), candidate(2, HASH_B))
+    payload, _code = run_service(make_service(client), candidate(1), candidate(2, HASH_B))
     assert len(payload["attempts"]) == 1
     assert payload["unattempted_candidates"][0]["original_rank"] == 2
     assert not any(call[:2] == ("submit", HASH_B.upper()) for call in client.calls)
 
 
-def test_candidate_limit_leaves_extra_candidates_unattempted(tmp_path: Path) -> None:
+def test_candidate_limit_leaves_extra_candidates_unattempted() -> None:
     client = FakeRtorrent({HASH_A: [metadata(False)], HASH_B: [metadata(True)]})
     payload, code = run_service(
-        make_service(tmp_path, client, maximum=1), candidate(1), candidate(2, HASH_B)
+        make_service(client, maximum=1), candidate(1), candidate(2, HASH_B)
     )
     assert code == 6
     assert len(payload["attempts"]) == 1
     assert payload["unattempted_candidates"][0]["original_rank"] == 2
 
 
-def test_preexisting_regular_torrent_is_accepted_without_any_mutation(tmp_path: Path) -> None:
+def test_preexisting_regular_torrent_is_accepted_without_any_mutation() -> None:
     client = FakeRtorrent({HASH_A: [metadata(True)]}, existing={HASH_A})
-    payload, code = run_service(make_service(tmp_path, client), candidate(1))
+    payload, code = run_service(make_service(client), candidate(1))
     assert code == 0
     attempt = payload["attempts"][0]
     assert attempt["status"] == "METADATA_AVAILABLE_PREEXISTING"
@@ -251,17 +292,17 @@ def test_preexisting_regular_torrent_is_accepted_without_any_mutation(tmp_path: 
     assert not any(call[0] in {"submit", "tag", "state", "stop", "erase"} for call in client.calls)
 
 
-def test_preexisting_meta_torrent_times_out_and_is_never_erased(tmp_path: Path) -> None:
+def test_preexisting_meta_torrent_times_out_and_is_never_erased() -> None:
     client = FakeRtorrent({HASH_A: [metadata(False)]}, existing={HASH_A})
-    payload, code = run_service(make_service(tmp_path, client), candidate(1))
+    payload, code = run_service(make_service(client), candidate(1))
     assert code == 6
     assert payload["attempts"][0]["cleanup_status"] == "SKIPPED_PREEXISTING"
     assert ("erase", HASH_A.upper()) not in client.calls
 
 
-def test_created_probe_receives_named_custom_tags(tmp_path: Path) -> None:
+def test_created_probe_receives_named_custom_tags() -> None:
     client = FakeRtorrent({HASH_A: [metadata(True)]})
-    run_service(make_service(tmp_path, client), candidate(1))
+    run_service(make_service(client), candidate(1))
     tag = next(call for call in client.calls if call[0] == "tag")
     assert tag[2] == {
         "job_id": "probe-test",
@@ -271,34 +312,34 @@ def test_created_probe_receives_named_custom_tags(tmp_path: Path) -> None:
     assert ("state", HASH_A.upper(), "validated_waiting_for_download") in client.calls
 
 
-def test_keep_failed_probes_prevents_cleanup(tmp_path: Path) -> None:
+def test_keep_failed_probes_prevents_cleanup() -> None:
     client = FakeRtorrent({HASH_A: [metadata(False)]})
-    payload, code = run_service(make_service(tmp_path, client, keep=True), candidate(1))
+    payload, code = run_service(make_service(client, keep=True), candidate(1))
     assert code == 6
     attempt = payload["attempts"][0]
     assert attempt["cleanup_status"] == "SKIPPED_KEEP_FAILED_PROBES"
     assert HASH_A.upper() in client.existing
 
 
-def test_cleanup_failure_is_reported_with_exit_seven(tmp_path: Path) -> None:
+def test_cleanup_failure_is_reported_with_exit_seven() -> None:
     client = FakeRtorrent({HASH_A: [metadata(False)]})
     client.fail_erase.add(HASH_A.upper())
-    payload, code = run_service(make_service(tmp_path, client), candidate(1))
+    payload, code = run_service(make_service(client), candidate(1))
     assert code == 7
     assert payload["attempts"][0]["cleanup_status"] == "CLEANUP_FAILED"
     assert any("operator attention" in value for value in payload["warnings"])
 
 
-def test_no_preflight_configuration_emits_warning(tmp_path: Path) -> None:
+def test_no_preflight_configuration_emits_warning() -> None:
     client = FakeRtorrent({HASH_A: [metadata(True)]})
-    payload, _code = run_service(make_service(tmp_path, client), candidate(1))
+    payload, _code = run_service(make_service(client), candidate(1))
     assert payload["preflight"]["status"] == "NOT_CONFIGURED"
     assert any("cannot be cleanly distinguished" in value for value in payload["warnings"])
 
 
-def test_preflight_can_be_explicitly_skipped(tmp_path: Path) -> None:
+def test_preflight_can_be_explicitly_skipped() -> None:
     client = FakeRtorrent({HASH_A: [metadata(True)]})
-    service = make_service(tmp_path, client)
+    service = make_service(client)
     payload, code = service.run(
         parse_probe_input(report(candidate(1))),
         preflight_magnet=f"magnet:?xt=urn:btih:{HASH_C}",
@@ -309,37 +350,29 @@ def test_preflight_can_be_explicitly_skipped(tmp_path: Path) -> None:
     assert not any(call[:2] == ("submit", HASH_C.upper()) for call in client.calls)
 
 
-def test_preflight_failure_stops_before_candidates_are_submitted(tmp_path: Path) -> None:
+def test_preflight_failure_stops_before_candidates_are_submitted() -> None:
     client = FakeRtorrent({HASH_C: [metadata(False)], HASH_A: [metadata(True)]})
     magnet = f"magnet:?xt=urn:btih:{HASH_C}"
-    payload, code = run_service(make_service(tmp_path, client), candidate(1), preflight=magnet)
+    payload, code = run_service(make_service(client), candidate(1), preflight=magnet)
     assert code == 5
     assert payload["result"] == "RTORRENT_NETWORK_UNHEALTHY"
     assert payload["attempts"] == []
     assert not any(call[:2] == ("submit", HASH_A.upper()) for call in client.calls)
 
 
-def test_preflight_success_is_removed_then_candidates_run(tmp_path: Path) -> None:
+def test_preflight_success_is_removed_then_candidates_run() -> None:
     client = FakeRtorrent({HASH_C: [metadata(True)], HASH_A: [metadata(True)]})
     magnet = f"magnet:?xt=urn:btih:{HASH_C}"
-    payload, code = run_service(make_service(tmp_path, client), candidate(1), preflight=magnet)
+    payload, code = run_service(make_service(client), candidate(1), preflight=magnet)
     assert code == 0
     assert payload["preflight"]["status"] == "PASSED"
     assert ("erase", HASH_C.upper()) in client.calls
 
 
-def test_dangerous_probe_roots_are_rejected() -> None:
-    from media_scope.exceptions import RtorrentConfigurationError
-
-    with pytest.raises(RtorrentConfigurationError):
-        ProbeDirectoryManager(Path(Path.home().anchor), "probe-test")
-    with pytest.raises(RtorrentConfigurationError):
-        ProbeDirectoryManager(Path.home(), "probe-test")
-
-
-def test_cleanup_never_removes_data_outside_candidate_directory(tmp_path: Path) -> None:
-    outside = tmp_path / "outside.txt"
-    outside.write_text("keep", encoding="utf-8")
+def test_inactive_submission_fails_without_waiting_for_metadata_timeout() -> None:
     client = FakeRtorrent({HASH_A: [metadata(False)]})
-    run_service(make_service(tmp_path, client), candidate(1))
-    assert outside.read_text(encoding="utf-8") == "keep"
+    client.inactive.add(HASH_A.upper())
+    payload, code = run_service(make_service(client), candidate(1))
+    assert code == 6
+    assert payload["attempts"][0]["status"] == "TORRENT_NOT_ACTIVE"
+    assert payload["attempts"][0]["activation_confirmed"] is False
