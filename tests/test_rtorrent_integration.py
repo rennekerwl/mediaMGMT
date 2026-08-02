@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import time
-from pathlib import Path
 
 import pytest
 
@@ -20,10 +19,7 @@ from media_scope.rtorrent_client import RtorrentClient
 def test_user_supplied_legal_magnet_retrieves_metadata_and_is_removed() -> None:
     """SIDE EFFECTS: temporarily adds, starts, stops, and erases the supplied magnet."""
     magnet = os.environ["RTORRENT_INTEGRATION_TEST_MAGNET"]
-    root = Path(os.environ["RTORRENT_PROBE_DIRECTORY"])
     validated = validate_magnet_uri(magnet)
-    manager = ProbeDirectoryManager(root, "probe-integration-test")
-    manager.prepare_job()
     client = RtorrentClient(
         os.environ["RTORRENT_RPC_URL"],
         username=os.getenv("RTORRENT_RPC_USERNAME", ""),
@@ -32,9 +28,16 @@ def test_user_supplied_legal_magnet_retrieves_metadata_and_is_removed() -> None:
     )
     created = False
     directory = None
+    manager: ProbeDirectoryManager | None = None
     try:
         with client:
             client.discover_capabilities()
+            manager = ProbeDirectoryManager(
+                client,
+                os.environ["RTORRENT_PROBE_DIRECTORY"],
+                "probe-integration-test",
+            )
+            manager.prepare_job()
             if client.torrent_exists(validated.infohash):
                 pytest.skip(
                     "The legal integration-test torrent already exists; it was not modified."
@@ -63,6 +66,7 @@ def test_user_supplied_legal_magnet_retrieves_metadata_and_is_removed() -> None:
                     client.stop(validated.infohash)
                     client.erase(validated.infohash)
     finally:
-        if directory is not None:
+        if directory is not None and manager is not None:
             manager.cleanup_candidate(directory)
-        manager.cleanup_empty_job()
+        if manager is not None:
+            manager.cleanup_empty_job()

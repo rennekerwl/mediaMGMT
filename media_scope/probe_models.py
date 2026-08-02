@@ -18,6 +18,7 @@ class ProbeState(StrEnum):
     METADATA_RETRIEVED = "METADATA_RETRIEVED"
     METADATA_TIMEOUT = "METADATA_TIMEOUT"
     SUBMISSION_FAILED = "SUBMISSION_FAILED"
+    TORRENT_NOT_ACTIVE = "TORRENT_NOT_ACTIVE"
     RPC_FAILED = "RPC_FAILED"
     CLEANING_UP = "CLEANING_UP"
     CLEANED_UP = "CLEANED_UP"
@@ -97,6 +98,7 @@ class AttemptRecord:
     cleanup_status: str = "NOT_REQUIRED"
     rtorrent_hash: str | None = None
     submission_method: str | None = None
+    activation_confirmed: bool = False
     warnings: list[str] = field(default_factory=list)
 
     def transition(self, state: ProbeState, at: str) -> None:
@@ -136,6 +138,7 @@ class AttemptRecord:
             "cleanup_status": self.cleanup_status,
             "rtorrent_hash": self.rtorrent_hash,
             "submission_method": self.submission_method,
+            "activation_confirmed": self.activation_confirmed,
             "warnings": self.warnings,
         }
 
