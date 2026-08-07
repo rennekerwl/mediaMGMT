@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "result": "download_failed",
+  "job_id": "download-10331-f17fb68ce756",
+  "scope": {
+    "tmdb_id": 10331,
+    "title": "Night of the Living Dead"
+  },
+  "candidate": {
+    "original_rank": 1,
+    "infohash": "f17fb68ce756227fce325d0513157915f5634985",
+    "release_title": "Night Of The Living Dead 1968 720p BRRip x264-x0r",
+    "magnet_uri": "magnet:?xt=urn:btih:f17fb68ce756227fce325d0513157915f5634985&dn=Night%20Of%20The%20Living%20Dead%201968%20720p%20BRRip%20x264-x0r&tr=udp:%2F%2Ftracker.opentrackr.org:1337&tr=udp:%2F%2Fopen.stealth.si:80%2Fannounce&tr=udp:%2F%2Ftracker.torrent.eu.org:451%2Fannounce&tr=udp:%2F%2Ftracker.bittor.pw:1337%2Fannounce&tr=udp:%2F%2Fpublic.popcorn-tracker.org:6969%2Fannounce&tr=udp:%2F%2Ftracker.dler.org:6969%2Fannounce&tr=udp:%2F%2Fexodus.desync.com:6969&tr=udp:%2F%2Fopen.demonii.com:1337%2Fannounce&tr=udp:%2F%2Fglotorrents.pw:6969%2Fannounce&tr=udp:%2F%2Ftracker.coppersurfer.tk:6969&tr=udp:%2F%2Ftorrent.gresille.org:80%2Fannounce&tr=udp:%2F%2Fp4p.arenabg.com:1337&tr=udp:%2F%2Ftracker.internetwarriors.net:1337"
+  },
+  "error_code": "TORRENT_STILL_META",
+  "message": "The selected rTorrent item is still metadata-only.",
+  "status": "TORRENT_STILL_META",
+  "ready_for_transfer": false,
+  "policy": {
+    "poll_interval_seconds": 5,
+    "stall_timeout_seconds": 120,
+    "overall_timeout_seconds": 300,
+    "post_completion_policy": "stop",
+    "post_processing_grace_seconds": 30.0
+  },
+  "storage": {
+    "protocol": "sftp",
+    "download_directory": "/home21/seedboxer1/downloads/rtorrent/media-downloads/10331-night-of-the-living-dead-f17fb68c"
+  },
+  "download": {
+    "status": "TORRENT_STILL_META",
+    "elapsed_seconds": 4.442,
+    "progress_percent": 0.0,
+    "completed_bytes": 0,
+    "remaining_bytes": 1,
+    "download_rate_bytes_per_second": 0,
+    "uploaded_bytes": 0,
+    "connected_peers": 0,
+    "complete_peers": 0,
+    "estimated_remaining_seconds": null,
+    "last_progress_at": null
+  },
+  "diagnostics": {},
+  "rtorrent": {
+    "rpc_endpoint": "https://seedboxer1.vega.usbx.me/RPC2",
+    "client_version": "0.9.6",
+    "torrent_retained": true
+  },
+  "state_transitions": [
+    {
+      "state": "PENDING",
+      "at": "2026-08-02T14:57:39.178117Z"
+    },
+    {
+      "state": "VALIDATING_INPUT",
+      "at": "2026-08-02T14:57:39.178135Z"
+    },
+    {
+      "state": "LOCATING_TORRENT",
+      "at": "2026-08-02T14:57:40.256908Z"
+    },
+    {
+      "state": "FAILED",
+      "at": "2026-08-02T14:57:43.619850Z"
+    }
+  ],
+  "warnings": []
+}

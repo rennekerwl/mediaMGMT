@@ -228,3 +228,10 @@ class DownloadPostProcessingError(DownloadError):
 
     error_code = "POST_PROCESSING_FAILED"
     exit_code = 8
+
+
+class SeedboxFilesystemError(DownloadError):
+    """Raised when the local controller cannot use the configured SFTP service."""
+
+    error_code = "SFTP_UNAVAILABLE"
+    exit_code = 4

@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import PurePosixPath
 
 from media_scope.download_directories import DownloadDirectoryManager
 from media_scope.download_models import (
@@ -39,7 +39,6 @@ class DownloadPolicy:
     poll_interval_seconds: float = 30
     stall_timeout_seconds: float = 1800
     overall_timeout_seconds: float = 0
-    minimum_free_space_bytes: int = 0
     post_completion_policy: str = "stop"
     post_processing_grace_seconds: float = 30
 
@@ -90,7 +89,7 @@ class TorrentDownloadService:
         started = self.monotonic()
         initial: DownloadSnapshot | None = None
         capabilities: DownloadCapabilities | None = None
-        storage: JsonObject = {}
+        storage: JsonObject = self.directories.storage_payload()
         candidate = health.candidate
         self.record.transition(DownloadState.PENDING, self._timestamp())
         self.record.transition(DownloadState.VALIDATING_INPUT, self._timestamp())
@@ -128,7 +127,7 @@ class TorrentDownloadService:
                 )
 
             self.record.transition(DownloadState.PREPARING_DIRECTORY, self._timestamp())
-            current_directory = _safe_resolve(initial.directory)
+            current_directory = _safe_remote_path(initial.directory)
             owned = (
                 previous_job == self.job_id or current_directory == self.directories.job_directory
             )
@@ -136,8 +135,6 @@ class TorrentDownloadService:
             initial = self._prepare_torrent(initial, target, dry_run=dry_run)
             self.latest_snapshot = initial
 
-            self.record.transition(DownloadState.CHECKING_DISK_SPACE, self._timestamp())
-            storage = self._check_space(initial, at_start=True)
             if dry_run:
                 return (
                     self._dry_run_report(health, initial, capabilities, storage, target),
@@ -215,22 +212,22 @@ class TorrentDownloadService:
     def _prepare_torrent(
         self,
         snapshot: DownloadSnapshot,
-        target: Path,
+        target: PurePosixPath,
         *,
         dry_run: bool,
     ) -> DownloadSnapshot:
-        current = _safe_resolve(snapshot.directory)
+        current = _safe_remote_path(snapshot.directory)
         if current == target:
             return snapshot
-        base_path = _safe_resolve(snapshot.base_path)
+        base_path = _safe_remote_path(snapshot.base_path)
         on_disk_bytes = 0
-        if base_path is not None and base_path.exists():
+        if base_path is not None and self.directories.filesystem.exists(base_path):
             on_disk_bytes = self.directories.on_disk_size(base_path)
         if (
             current is not None
             and self.directories.probe_root is not None
             and _path_is_under(current, self.directories.probe_root)
-            and current.exists()
+            and self.directories.filesystem.exists(current)
         ):
             on_disk_bytes = max(on_disk_bytes, self.directories.on_disk_size(current))
         if snapshot.completed_bytes > 0 or on_disk_bytes > 0:
@@ -271,7 +268,7 @@ class TorrentDownloadService:
         self.client.set_download_directory(snapshot.infohash, target)
         updated = self.client.download_snapshot(snapshot.infohash)
         self.latest_snapshot = updated
-        if _safe_resolve(updated.directory) != target:
+        if _safe_remote_path(updated.directory) != target:
             raise RuntimeFailure(
                 "TORRENT_STATE_INVALID",
                 "TORRENT_STATE_INVALID",
@@ -334,17 +331,6 @@ class TorrentDownloadService:
             if self._is_complete(current):
                 return current
 
-            free = self.directories.free_bytes()
-            required = current.left_bytes + self.policy.minimum_free_space_bytes
-            if free < required:
-                self._stop_and_mark(infohash, DownloadState.PAUSED_LOW_DISK_SPACE)
-                raise RuntimeFailure(
-                    "LOW_DISK_SPACE_DURING_DOWNLOAD",
-                    "PAUSED_LOW_DISK_SPACE",
-                    "Free space fell below remaining payload bytes plus the configured reserve.",
-                    5,
-                    self._space_details(current, free),
-                )
             now = self.monotonic()
             if (
                 self.policy.overall_timeout_seconds > 0
@@ -448,7 +434,7 @@ class TorrentDownloadService:
                     "top_level_paths": top_level,
                     "payload_size_bytes": payload_size,
                     "path_changed_after_completion": (
-                        _safe_resolve(base_at_completion) != final_path
+                        _safe_remote_path(base_at_completion) != final_path
                     ),
                 },
                 "rtorrent": {
@@ -464,36 +450,6 @@ class TorrentDownloadService:
             },
             0,
         )
-
-    def _check_space(self, snapshot: DownloadSnapshot, *, at_start: bool) -> JsonObject:
-        free = self.directories.free_bytes()
-        remaining = max(snapshot.size_bytes - snapshot.completed_bytes, snapshot.left_bytes, 0)
-        details = self._space_details(snapshot, free)
-        details.update(
-            {
-                "download_directory": str(self.directories.job_directory),
-                "filesystem_free_bytes_at_start": free if at_start else None,
-            }
-        )
-        if free < remaining + self.policy.minimum_free_space_bytes:
-            raise RuntimeFailure(
-                "INSUFFICIENT_DISK_SPACE",
-                "INSUFFICIENT_DISK_SPACE",
-                "Free space is less than remaining payload bytes plus the configured reserve.",
-                5,
-                details,
-            )
-        return details
-
-    def _space_details(self, snapshot: DownloadSnapshot, free: int) -> JsonObject:
-        remaining = max(snapshot.size_bytes - snapshot.completed_bytes, snapshot.left_bytes, 0)
-        return {
-            "torrent_size_bytes": snapshot.size_bytes,
-            "completed_bytes": snapshot.completed_bytes,
-            "remaining_bytes": remaining,
-            "filesystem_free_bytes": free,
-            "required_reserve_bytes": self.policy.minimum_free_space_bytes,
-        }
 
     def _validate_identity(self, snapshot: DownloadSnapshot, expected: str) -> None:
         if snapshot.infohash.casefold() != expected.casefold():
@@ -575,7 +531,7 @@ class TorrentDownloadService:
         snapshot: DownloadSnapshot,
         capabilities: DownloadCapabilities,
         storage: JsonObject,
-        target: Path,
+        target: PurePosixPath,
     ) -> JsonObject:
         return {
             "schema_version": 1,
@@ -611,7 +567,6 @@ class TorrentDownloadService:
     ) -> JsonObject:
         if not self.record.transitions or self.record.transitions[-1].get("state") not in {
             DownloadState.STALLED.value,
-            DownloadState.PAUSED_LOW_DISK_SPACE.value,
         }:
             self.record.transition(DownloadState.FAILED, self._timestamp())
         download: JsonObject = {
@@ -716,14 +671,16 @@ def _stall_reason(snapshot: DownloadSnapshot) -> str:
     return "CONNECTED_BUT_NO_PROGRESS"
 
 
-def _safe_resolve(value: str) -> Path | None:
+def _safe_remote_path(value: str) -> PurePosixPath | None:
     if not value or any(character in value for character in ("\x00", "\n", "\r")):
         return None
-    path = Path(value)
-    return path.resolve() if path.is_absolute() else None
+    if "\\" in value:
+        return None
+    path = PurePosixPath(value)
+    return path if path.is_absolute() and ".." not in path.parts else None
 
 
-def _path_is_under(path: Path, root: Path) -> bool:
+def _path_is_under(path: PurePosixPath, root: PurePosixPath) -> bool:
     try:
         path.relative_to(root)
     except ValueError:

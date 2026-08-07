@@ -54,6 +54,24 @@ def test_tv_search_uses_first_air_date_year_parameter() -> None:
         assert client.search_tv("The Good Place", 2016) == []
 
 
+def test_movie_recommendations_use_first_page() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/movie/1091/recommendations")
+        assert request.url.params["page"] == "1"
+        return httpx.Response(200, json={"results": [{"id": 2}]})
+
+    with client_for(handler) as client:
+        assert client.get_movie_recommendations(1091) == [{"id": 2}]
+
+
+def test_malformed_movie_recommendations_raise_invalid_response() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"results": "not-a-list"})
+
+    with client_for(handler) as client, pytest.raises(InvalidResponseError):
+        client.get_movie_recommendations(1091)
+
+
 @pytest.mark.parametrize(
     ("status", "exception_type"),
     [(401, AuthenticationError), (404, NotFoundError), (400, TmdbApiError)],

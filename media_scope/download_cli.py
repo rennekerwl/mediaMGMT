@@ -29,11 +29,13 @@ from media_scope.exceptions import (
     RtorrentError,
 )
 from media_scope.models import JsonObject
+from media_scope.remote_filesystem import SftpRemoteFilesystem
 from media_scope.rtorrent_client import RtorrentClient
 from media_scope.serialization import configure_utf8_stdio, serialize_json
 
 LOGGER = logging.getLogger("media_scope.download")
 ClientFactory = Callable[..., RtorrentClient]
+FilesystemFactory = Callable[..., SftpRemoteFilesystem]
 
 
 def build_download_parser() -> argparse.ArgumentParser:
@@ -57,7 +59,7 @@ def build_download_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Validate input, live torrent state, paths, and space without mutations.",
+        help="Validate input, live torrent state, and remote paths without mutations.",
     )
     return parser
 
@@ -66,6 +68,7 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     client_factory: ClientFactory | None = None,
+    filesystem_factory: FilesystemFactory | None = None,
     transport: httpx.BaseTransport | None = None,
 ) -> int:
     """Run Step 6 and return its documented process exit code."""
@@ -103,9 +106,6 @@ def main(
                 if args.download_timeout_seconds is not None
                 else _environment_nonnegative_number("RTORRENT_DOWNLOAD_TIMEOUT_SECONDS", 0)
             ),
-            minimum_free_space_bytes=_environment_nonnegative_int(
-                "RTORRENT_MIN_FREE_SPACE_BYTES", 0
-            ),
             post_completion_policy=_post_policy(
                 args.post_completion_policy or os.getenv("RTORRENT_POST_COMPLETION_POLICY", "stop")
             ),
@@ -121,27 +121,29 @@ def main(
             error.error_code = "UNSAFE_DOWNLOAD_ROOT"
             raise error
         allowed = [
-            Path(value.strip())
+            value.strip()
             for value in os.getenv("RTORRENT_ALLOWED_FINAL_ROOTS", "").split(",")
             if value.strip()
         ]
         probe_text = os.getenv("RTORRENT_PROBE_DIRECTORY", "").strip()
-        directories = DownloadDirectoryManager(
-            Path(root_text),
-            tmdb_id=health.scope.get("tmdb_id", "unknown"),
-            title=str(health.scope.get("title") or health.candidate.release_title),
-            infohash=health.candidate.infohash,
-            probe_root=Path(probe_text) if probe_text else None,
-            allowed_final_roots=allowed,
-        )
         client = _create_client(client_factory, transport)
+        filesystem = _create_filesystem(filesystem_factory)
         LOGGER.info(
             "Starting download job %s for hash %s against %s.",
             job_id,
             _short_hash(health.candidate.infohash),
             client.sanitized_endpoint,
         )
-        with client:
+        with client, filesystem:
+            directories = DownloadDirectoryManager(
+                filesystem,
+                root_text,
+                tmdb_id=health.scope.get("tmdb_id", "unknown"),
+                title=str(health.scope.get("title") or health.candidate.release_title),
+                infohash=health.candidate.infohash,
+                probe_root=probe_text or None,
+                allowed_final_roots=allowed,
+            )
             payload, exit_code = TorrentDownloadService(
                 client,
                 directories,
@@ -188,6 +190,19 @@ def _create_client(
         verify_tls=_environment_bool("RTORRENT_RPC_VERIFY_TLS", True),
         timeout_seconds=_environment_positive_number("RTORRENT_RPC_TIMEOUT_SECONDS", 15),
         transport=transport,
+    )
+
+
+def _create_filesystem(factory: FilesystemFactory | None) -> SftpRemoteFilesystem:
+    constructor = factory or SftpRemoteFilesystem
+    known_hosts_text = os.getenv("SEEDBOX_SSH_KNOWN_HOSTS", "").strip()
+    return constructor(
+        os.getenv("SEEDBOX_SSH_HOST", "").strip(),
+        port=_environment_positive_int("SEEDBOX_SSH_PORT", 22),
+        username=os.getenv("SEEDBOX_USERNAME", "").strip(),
+        password=os.getenv("SEEDBOX_PASSWORD", ""),
+        timeout_seconds=_environment_positive_number("SEEDBOX_SSH_TIMEOUT_SECONDS", 15),
+        known_hosts=Path(known_hosts_text) if known_hosts_text else None,
     )
 
 
@@ -260,18 +275,18 @@ def _environment_nonnegative_number(name: str, default: float) -> float:
     return parsed
 
 
-def _environment_nonnegative_int(name: str, default: int) -> int:
+def _environment_positive_int(name: str, default: int) -> int:
     value = os.getenv(name, "").strip()
     if not value:
         return default
     try:
         parsed = int(value)
     except ValueError as exc:
-        error = DownloadStorageError(f"{name} must be a nonnegative integer.")
+        error = DownloadStorageError(f"{name} must be a positive integer.")
         error.exit_code = 2
         raise error from exc
-    if parsed < 0:
-        error = DownloadStorageError(f"{name} must be a nonnegative integer.")
+    if parsed <= 0:
+        error = DownloadStorageError(f"{name} must be a positive integer.")
         error.exit_code = 2
         raise error
     return parsed

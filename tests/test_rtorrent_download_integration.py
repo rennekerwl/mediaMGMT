@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -20,11 +20,11 @@ def test_user_supplied_legal_small_torrent_download(monkeypatch: pytest.MonkeyPa
     if not health_text or not directory_text:
         pytest.fail(
             "Set RTORRENT_DOWNLOAD_INTEGRATION_HEALTH_RESULT and the dedicated "
-            "RTORRENT_DOWNLOAD_INTEGRATION_DIRECTORY."
+            "RTORRENT_DOWNLOAD_INTEGRATION_DIRECTORY as an absolute seedbox POSIX path."
         )
     health = Path(health_text).resolve()
-    directory = Path(directory_text).resolve()
-    if not health.is_file() or not directory.is_absolute():
+    directory = PurePosixPath(directory_text)
+    if not health.is_file() or not directory.is_absolute() or ".." in directory.parts:
         pytest.fail("The integration health result must exist and the directory must be absolute.")
     print(
         "SIDE EFFECTS: resumes the existing legal Step 5 torrent, writes payload under "
