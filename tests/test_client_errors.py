@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import date
 
 import httpx
 import pytest
@@ -70,6 +71,56 @@ def test_malformed_movie_recommendations_raise_invalid_response() -> None:
 
     with client_for(handler) as client, pytest.raises(InvalidResponseError):
         client.get_movie_recommendations(1091)
+
+
+def test_movie_discovery_uses_quality_and_release_filters() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/discover/movie")
+        assert request.url.params["page"] == "2"
+        assert request.url.params["primary_release_date.lte"] == "2026-08-06"
+        assert request.url.params["vote_average.gte"] == "7.0"
+        assert request.url.params["vote_count.gte"] == "500"
+        assert request.url.params["sort_by"] == "vote_average.desc"
+        assert request.url.params["include_adult"] == "false"
+        assert request.url.params["include_video"] == "false"
+        return httpx.Response(200, json={"results": [{"id": 2}]})
+
+    with client_for(handler) as client:
+        assert client.discover_movies(
+            page=2,
+            released_through=date(2026, 8, 6),
+            min_vote_average=7.0,
+            min_vote_count=500,
+        ) == [{"id": 2}]
+
+
+def test_malformed_movie_discovery_raises_invalid_response() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"results": "not-a-list"})
+
+    with client_for(handler) as client, pytest.raises(InvalidResponseError):
+        client.discover_movies(
+            page=1,
+            released_through=date(2026, 8, 6),
+            min_vote_average=7.0,
+            min_vote_count=500,
+        )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"page": 0, "min_vote_average": 7.0, "min_vote_count": 500}, "page"),
+        ({"page": 1, "min_vote_average": 11.0, "min_vote_count": 500}, "average"),
+        ({"page": 1, "min_vote_average": 7.0, "min_vote_count": -1}, "count"),
+    ],
+)
+def test_movie_discovery_validates_filters(kwargs: dict[str, int | float], message: str) -> None:
+    with (
+        client_for(lambda _request: httpx.Response(500)) as client,
+        pytest.raises(ValueError, match=message),
+    ):
+        client.discover_movies(released_through=date(2026, 8, 6), **kwargs)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(

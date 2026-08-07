@@ -13,7 +13,11 @@ from typing import Protocol
 
 from media_scope.models import JsonObject
 
-MOVIE_TARGET = 3
+MOVIE_TRIGGER_COUNT = 3
+RECOMMENDATION_COUNT = 3
+DISCOVERY_MAX_PAGES = 3
+DISCOVERY_MIN_VOTE_AVERAGE = 7.0
+DISCOVERY_MIN_VOTE_COUNT = 500
 VIDEO_EXTENSIONS = frozenset({".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm", ".wmv"})
 RATING_LABELS = {
     1: "hated it",
@@ -36,6 +40,15 @@ class RecommendationClient(Protocol):
     def search_movies(self, title: str, year: int | None = None) -> list[JsonObject]: ...
 
     def get_movie_recommendations(self, tmdb_id: int) -> list[JsonObject]: ...
+
+    def discover_movies(
+        self,
+        *,
+        page: int,
+        released_through: date,
+        min_vote_average: float,
+        min_vote_count: int,
+    ) -> list[JsonObject]: ...
 
 
 @dataclass(frozen=True)
@@ -65,9 +78,11 @@ class Recommendation:
     tmdb_id: int
     title: str
     year: int
-    support: int
+    weighted_support: float
+    genre_ids: frozenset[int]
     popularity: float
     vote_average: float
+    vote_count: int
 
 
 def count_movies(directory: Path) -> int:
@@ -144,13 +159,12 @@ def build_recommendations(
     client: RecommendationClient,
     ratings: list[RatingRow],
     *,
-    limit: int,
     today: date,
     warn: WarningHandler,
 ) -> list[Recommendation]:
-    """Resolve ratings, merge TMDb recommendations, filter them, and rank the result."""
+    """Build two personalized choices followed by one broader exploration choice."""
     rated_ids: set[int] = set()
-    liked_ids: set[int] = set()
+    seed_weights: dict[int, float] = {}
 
     for rating in ratings:
         results = client.search_movies(rating.title, rating.year)
@@ -165,13 +179,19 @@ def build_recommendations(
         tmdb_id = int(resolved["id"])
         rated_ids.add(tmdb_id)
         if rating.liked:
-            liked_ids.add(tmdb_id)
+            weight = 1.5 if rating.rating == 5 else 1.0
+            seed_weights[tmdb_id] = max(seed_weights.get(tmdb_id, 0.0), weight)
 
     candidates: dict[int, Recommendation] = {}
-    for liked_id in sorted(liked_ids):
+    for liked_id in sorted(seed_weights):
+        seed_weight = seed_weights[liked_id]
         seen_for_seed: set[int] = set()
         for payload in client.get_movie_recommendations(liked_id):
-            candidate = _candidate_from_payload(payload, today=today)
+            candidate = _candidate_from_payload(
+                payload,
+                today=today,
+                weighted_support=seed_weight,
+            )
             if (
                 candidate is None
                 or candidate.tmdb_id in rated_ids
@@ -187,16 +207,32 @@ def build_recommendations(
                     tmdb_id=candidate.tmdb_id,
                     title=candidate.title,
                     year=candidate.year,
-                    support=previous.support + 1,
+                    weighted_support=previous.weighted_support + seed_weight,
+                    genre_ids=candidate.genre_ids,
                     popularity=max(previous.popularity, candidate.popularity),
                     vote_average=max(previous.vote_average, candidate.vote_average),
+                    vote_count=max(previous.vote_count, candidate.vote_count),
                 )
 
-    ranked = sorted(
-        candidates.values(),
-        key=lambda item: (-item.support, -item.popularity, -item.vote_average, item.tmdb_id),
+    selected = _select_personalized(list(candidates.values()))
+    discovery = _load_discovery_candidates(
+        client,
+        rated_ids=rated_ids,
+        selected_ids={item.tmdb_id for item in selected},
+        needed=RECOMMENDATION_COUNT - len(selected),
+        today=today,
     )
-    return ranked[:limit]
+
+    while len(selected) < RECOMMENDATION_COUNT - 1 and discovery:
+        choice = _select_discovery_backfill(list(discovery.values()), selected)
+        selected.append(choice)
+        discovery.pop(choice.tmdb_id)
+
+    if discovery and len(selected) < RECOMMENDATION_COUNT:
+        exploration = _select_exploration(list(discovery.values()), selected)
+        selected.append(exploration)
+
+    return selected
 
 
 def format_recommendations(recommendations: list[Recommendation]) -> str:
@@ -217,20 +253,32 @@ def _most_popular_valid_result(results: list[JsonObject]) -> JsonObject | None:
     )
 
 
-def _candidate_from_payload(payload: JsonObject, *, today: date) -> Recommendation | None:
+def _candidate_from_payload(
+    payload: JsonObject,
+    *,
+    today: date,
+    weighted_support: float = 0.0,
+) -> Recommendation | None:
     tmdb_id = _positive_int(payload.get("id"))
     title = payload.get("title")
     release_text = payload.get("release_date")
+    raw_genre_ids = payload.get("genre_ids")
     popularity = _finite_number(payload.get("popularity"))
     vote_average = _finite_number(payload.get("vote_average"))
+    vote_count = _nonnegative_int(payload.get("vote_count"))
     if (
         tmdb_id is None
         or not isinstance(title, str)
         or not title.strip()
         or payload.get("adult") is not False
+        or payload.get("video") is not False
         or not isinstance(release_text, str)
+        or not isinstance(raw_genre_ids, list)
+        or not raw_genre_ids
+        or any(_positive_int(value) is None for value in raw_genre_ids)
         or popularity is None
         or vote_average is None
+        or vote_count is None
     ):
         return None
     try:
@@ -243,14 +291,113 @@ def _candidate_from_payload(payload: JsonObject, *, today: date) -> Recommendati
         tmdb_id=tmdb_id,
         title=title.strip(),
         year=release_date.year,
-        support=1,
+        weighted_support=weighted_support,
+        genre_ids=frozenset(int(value) for value in raw_genre_ids),
         popularity=popularity,
         vote_average=vote_average,
+        vote_count=vote_count,
     )
+
+
+def _select_personalized(candidates: list[Recommendation]) -> list[Recommendation]:
+    if not candidates:
+        return []
+    first = min(candidates, key=_relevance_key)
+    remaining = [item for item in candidates if item.tmdb_id != first.tmdb_id]
+    if not remaining:
+        return [first]
+
+    preferred = [item for item in remaining if _genre_overlap(item, first.genre_ids) <= 1]
+    if preferred:
+        second = min(preferred, key=_relevance_key)
+    else:
+        second = min(
+            remaining,
+            key=lambda item: (_genre_overlap(item, first.genre_ids), *_relevance_key(item)),
+        )
+    return [first, second]
+
+
+def _load_discovery_candidates(
+    client: RecommendationClient,
+    *,
+    rated_ids: set[int],
+    selected_ids: set[int],
+    needed: int,
+    today: date,
+) -> dict[int, Recommendation]:
+    candidates: dict[int, Recommendation] = {}
+    for page in range(1, DISCOVERY_MAX_PAGES + 1):
+        payloads = client.discover_movies(
+            page=page,
+            released_through=today,
+            min_vote_average=DISCOVERY_MIN_VOTE_AVERAGE,
+            min_vote_count=DISCOVERY_MIN_VOTE_COUNT,
+        )
+        for payload in payloads:
+            candidate = _candidate_from_payload(payload, today=today)
+            if (
+                candidate is not None
+                and candidate.tmdb_id not in rated_ids
+                and candidate.tmdb_id not in selected_ids
+                and candidate.vote_average >= DISCOVERY_MIN_VOTE_AVERAGE
+                and candidate.vote_count >= DISCOVERY_MIN_VOTE_COUNT
+            ):
+                candidates.setdefault(candidate.tmdb_id, candidate)
+        if len(candidates) >= needed:
+            break
+    return candidates
+
+
+def _select_discovery_backfill(
+    candidates: list[Recommendation],
+    selected: list[Recommendation],
+) -> Recommendation:
+    if not selected:
+        return min(candidates, key=_quality_key)
+    reference_genres = selected[0].genre_ids
+    preferred = [item for item in candidates if _genre_overlap(item, reference_genres) <= 1]
+    if preferred:
+        return min(preferred, key=_quality_key)
+    return min(
+        candidates,
+        key=lambda item: (_genre_overlap(item, reference_genres), *_quality_key(item)),
+    )
+
+
+def _select_exploration(
+    candidates: list[Recommendation],
+    selected: list[Recommendation],
+) -> Recommendation:
+    selected_genres = frozenset(
+        genre_id for recommendation in selected for genre_id in recommendation.genre_ids
+    )
+    return min(
+        candidates,
+        key=lambda item: (_genre_overlap(item, selected_genres), *_quality_key(item)),
+    )
+
+
+def _relevance_key(item: Recommendation) -> tuple[float, float, float, int]:
+    return (-item.weighted_support, -item.popularity, -item.vote_average, item.tmdb_id)
+
+
+def _quality_key(item: Recommendation) -> tuple[float, int, float, int]:
+    return (-item.vote_average, -item.vote_count, -item.popularity, item.tmdb_id)
+
+
+def _genre_overlap(item: Recommendation, genre_ids: frozenset[int]) -> int:
+    return len(item.genre_ids & genre_ids)
 
 
 def _positive_int(value: object) -> int | None:
     if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
+
+
+def _nonnegative_int(value: object) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return value
     return None
 
