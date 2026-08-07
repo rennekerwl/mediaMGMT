@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from collections import namedtuple
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import pytest
@@ -14,9 +13,8 @@ from media_scope.download_directories import DownloadDirectoryManager
 from media_scope.download_input import parse_download_input
 from media_scope.download_models import DownloadCapabilities, DownloadSnapshot
 from media_scope.download_service import DownloadPolicy, TorrentDownloadService
+from tests.fake_remote_filesystem import FakeRemoteFilesystem
 from tests.test_download_input import HASH_A, health_result
-
-Usage = namedtuple("Usage", "total used free")
 
 
 class Clock:
@@ -85,8 +83,18 @@ class FakeDownloadClient:
         self.calls.append(("stop", infohash))
 
 
+def remote_path(path: Path | PurePosixPath) -> PurePosixPath:
+    if isinstance(path, PurePosixPath):
+        return path
+    names = list(path.parts)
+    for root in ("downloads", "library", "outside", "probes"):
+        if root in names:
+            return PurePosixPath("/", *names[names.index(root) :])
+    return PurePosixPath("/downloads", path.name)
+
+
 def snapshot(
-    directory: Path,
+    directory: Path | PurePosixPath,
     *,
     completed: int = 0,
     size: int = 100,
@@ -96,7 +104,7 @@ def snapshot(
     peers: int = 2,
     message: str | None = None,
     hashing: bool = False,
-    base_path: Path | None = None,
+    base_path: Path | PurePosixPath | None = None,
 ) -> DownloadSnapshot:
     return DownloadSnapshot(
         infohash=HASH_A,
@@ -115,8 +123,8 @@ def snapshot(
         connected_peers=peers,
         complete_peers=1,
         message=message,
-        base_path=str(base_path or directory / "payload"),
-        directory=str(directory),
+        base_path=str(remote_path(base_path or directory / "payload")),
+        directory=str(remote_path(directory)),
         ratio=0,
         hashing=hashing,
     )
@@ -126,27 +134,21 @@ def make_service(
     tmp_path: Path,
     client: FakeDownloadClient,
     *,
-    free: list[int] | None = None,
     stall: float = 10,
     timeout: float = 0,
     grace: float = 0,
     post_policy: str = "stop",
     allowed: list[Path] | None = None,
 ) -> tuple[TorrentDownloadService, DownloadDirectoryManager, Clock]:
-    root = (tmp_path / "downloads").resolve()
-    values = list(free or [10_000])
-
-    def disk_usage(_path: Path) -> Usage:
-        value = values.pop(0) if len(values) > 1 else values[0]
-        return Usage(20_000, 20_000 - value, value)
-
+    root = PurePosixPath("/downloads")
+    filesystem = FakeRemoteFilesystem()
     directories = DownloadDirectoryManager(
+        filesystem,
         root,
         tmdb_id=4608,
         title="30 Rock",
         infohash=HASH_A,
-        allowed_final_roots=allowed or [],
-        disk_usage=disk_usage,
+        allowed_final_roots=[remote_path(item) for item in allowed or []],
     )
     clock = Clock()
     service = TorrentDownloadService(
@@ -156,7 +158,6 @@ def make_service(
             poll_interval_seconds=1,
             stall_timeout_seconds=stall,
             overall_timeout_seconds=timeout,
-            minimum_free_space_bytes=50,
             post_completion_policy=post_policy,
             post_processing_grace_seconds=grace,
         ),
@@ -172,10 +173,9 @@ def run(service: TorrentDownloadService, **kwargs: Any) -> tuple[dict[str, Any],
     return service.run(parse_download_input(health_result()), **kwargs)
 
 
-def prepare_payload(directories: DownloadDirectoryManager, name: str = "payload") -> Path:
+def prepare_payload(directories: DownloadDirectoryManager, name: str = "payload") -> PurePosixPath:
     path = directories.job_directory / name
-    path.mkdir(parents=True)
-    (path / "episode.mkv").write_bytes(b"payload")
+    directories.filesystem.add_file(path / "episode.mkv", size=7)  # type: ignore[attr-defined]
     return path
 
 
@@ -261,41 +261,9 @@ def test_empty_probe_directory_is_redirected_and_confirmed_before_start(tmp_path
     )
     start_call = next(index for index, call in enumerate(client.calls) if call[0] == "start")
     assert directory_call < start_call
-    assert payload["paths"]["base_path_before_download"] == str(target / "payload")
-
-
-def test_insufficient_initial_space_never_starts(tmp_path: Path) -> None:
-    target = (tmp_path / "downloads" / "4608-30-rock-aaaaaaaa").resolve()
-    client = FakeDownloadClient([snapshot(target, active=False, rate=0)])
-    payload, code = run(make_service(tmp_path, client, free=[149])[0])
-    assert (code, payload["error_code"]) == (5, "INSUFFICIENT_DISK_SPACE")
-    assert not any(call[0] == "start" for call in client.calls)
-
-
-def test_completed_bytes_reduce_required_space_and_reserve_is_enforced(tmp_path: Path) -> None:
-    target = (tmp_path / "downloads" / "4608-30-rock-aaaaaaaa").resolve()
-    client = FakeDownloadClient(
-        [
-            snapshot(target, completed=90, active=False, rate=0),
-            snapshot(target, completed=100, complete=True, rate=0),
-        ]
+    assert (
+        payload["paths"]["base_path_before_download"] == "/downloads/4608-30-rock-aaaaaaaa/payload"
     )
-    service, directories, _clock = make_service(tmp_path, client, free=[60])
-    prepare_payload(directories)
-    _payload, code = run(service)
-    assert code == 0
-
-
-def test_low_disk_during_download_stops_and_preserves_data(tmp_path: Path) -> None:
-    target = (tmp_path / "downloads" / "4608-30-rock-aaaaaaaa").resolve()
-    client = FakeDownloadClient(
-        [snapshot(target, active=False, rate=0), snapshot(target, completed=10)]
-    )
-    payload, code = run(make_service(tmp_path, client, free=[1000, 100])[0])
-    assert (code, payload["error_code"]) == (5, "LOW_DISK_SPACE_DURING_DOWNLOAD")
-    assert payload["status"] == "PAUSED_LOW_DISK_SPACE"
-    assert ("stop", HASH_A) in client.calls
-    assert not any(call[0] == "erase" for call in client.calls)
 
 
 @pytest.mark.parametrize(
@@ -487,10 +455,11 @@ def test_completion_hook_path_move_to_allowed_root_is_detected(tmp_path: Path) -
     before = snapshot(target, completed=100, complete=True, rate=0)
     after = snapshot(target, completed=100, complete=True, rate=0, base_path=moved)
     client = FakeDownloadClient([before, after])
-    service, _directories, _clock = make_service(tmp_path, client, grace=1, allowed=[allowed])
+    service, directories, _clock = make_service(tmp_path, client, grace=1, allowed=[allowed])
+    directories.filesystem.add_file("/library/30 Rock/episode.mkv", size=4)  # type: ignore[attr-defined]
     payload, code = run(service)
     assert code == 0
-    assert payload["paths"]["final_base_path"] == str(moved)
+    assert payload["paths"]["final_base_path"] == "/library/30 Rock"
     assert payload["paths"]["path_changed_after_completion"] is True
 
 
@@ -501,7 +470,8 @@ def test_completion_hook_path_outside_allowlist_is_rejected(tmp_path: Path) -> N
     client = FakeDownloadClient(
         [snapshot(target, completed=100, complete=True, rate=0, base_path=outside)]
     )
-    service, _directories, _clock = make_service(tmp_path, client)
+    service, directories, _clock = make_service(tmp_path, client)
+    directories.filesystem.add_directory("/outside/payload")  # type: ignore[attr-defined]
     payload, code = run(service)
     assert (code, payload["error_code"]) == (8, "FINAL_PATH_OUTSIDE_ALLOWED_ROOT")
     assert payload["ready_for_transfer"] is False

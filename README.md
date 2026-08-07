@@ -1,6 +1,6 @@
 # media-scope
 
-`media-scope` is a deterministic Python media-management project with three independent
+`media-scope` is a deterministic Python media-management project with four independent
 components:
 
 - `media-scope` identifies an exact released movie, a complete ended television
@@ -10,18 +10,21 @@ components:
   Jackett indexers for releases whose titles appear to cover the complete series.
 - `media-probe-torrents` consumes the ranked Jackett report and asks rTorrent to
   retrieve magnet metadata, stopping after the first live candidate succeeds.
+- `media-recommend` performs one movies-folder check and writes a short TMDb
+  recommendation list when fewer than three movies are present.
 
-Its scope is intentionally narrow. It does not recommend media, scrape websites,
-download complete torrent payloads, inspect torrent file lists, transfer files, or
-monitor folders. The Jackett component
-classifies only release titles and Torznab metadata; it does not approve a result or
-decide whether a work is legally distributable. It may retrieve a small `.torrent`
-metainfo response from Jackett solely to calculate its BitTorrent v1 infohash.
+Its scope is intentionally narrow. It does not scrape websites, inspect torrent file
+lists, transfer files, or run a continuous folder-monitoring service. The Jackett
+component classifies only release titles and Torznab metadata; it does not approve a
+result or decide whether a work is legally distributable. It may retrieve a small
+`.torrent` metainfo response from Jackett solely to calculate its BitTorrent v1
+infohash.
 
 ## Requirements
 
 - Python 3.12 or newer
 - A TMDb API Read Access Token for scope generation
+- A published Google Sheet CSV for movie recommendations
 - A running, user-configured Jackett service for complete-series searches
 - A running rTorrent instance exposed through a user-secured HTTP(S) XML-RPC gateway
   for live health probes
@@ -64,6 +67,42 @@ TMDB_BEARER_TOKEN=replace_with_your_tmdb_read_access_token
 The `.env` file is ignored by Git. The token may instead be set directly in the
 process environment. It is sent only as an `Authorization: Bearer` header and is
 never logged.
+
+## Movie recommendation configuration
+
+Publish the ratings tab of the Google Sheet as CSV, then configure its CSV URL and
+the local movies folder in `.env`:
+
+```dotenv
+MOVIES_DIRECTORY=C:\Media\Movies
+RECOMMENDATIONS_DIRECTORY=C:\Media
+GOOGLE_SHEET_CSV_URL=https://docs.google.com/spreadsheets/d/.../pub?output=csv
+```
+
+The CSV requires `Title` and `Rating` columns. `Year` is optional and `Notes` is
+ignored. Ratings are whole numbers: 1 means hated it, 2 disliked it, 3 neutral,
+4 liked it, and 5 loved it. Ratings 4 and 5 seed recommendations, while every
+resolved rated movie is excluded from the output.
+
+Run one check with either installed entry point:
+
+```powershell
+media-recommend --verbose
+python -m media_scope.recommend_cli --verbose
+```
+
+The command counts immediate child directories and top-level video files. Below
+three movies, it writes only enough `Title (Year)` lines to fill the gap to
+`RECOMMENDATIONS.txt` in `RECOMMENDATIONS_DIRECTORY`. At three or more movies, it
+makes no network requests and leaves any existing recommendation file unchanged.
+
+For Windows Task Scheduler, use `.venv\Scripts\python.exe` as the program,
+`-m media_scope.recommend_cli` as the arguments, and this repository as the
+**Start in** directory. A comparable cron entry on macOS or Linux is:
+
+```cron
+*/15 * * * * cd /path/to/mediaMGMT && .venv/bin/python -m media_scope.recommend_cli
+```
 
 ## Jackett configuration
 
@@ -481,7 +520,8 @@ fails, the result is `NO_HEALTHY_TORRENT_FOUND` and exit code 6.
 ## Full rTorrent payload download (Step 6)
 
 `media-download-torrent` consumes Step 5's successful JSON result and resumes the
-exact validated rTorrent item through full payload completion. It never submits the
+exact validated rTorrent item through full payload completion from the local Windows
+PC. It never submits the
 magnet again, never selects a fallback candidate, never erases the torrent, and never
 transfers payload files to the local PC. Step 7 will perform the SFTP transfer using
 the verified remote paths returned here.
@@ -499,19 +539,25 @@ Step 6 reuses Step 5's `RTORRENT_RPC_*` settings and adds:
 
 ```dotenv
 RTORRENT_DOWNLOAD_DIRECTORY=/srv/rtorrent/completed-media-downloads
-RTORRENT_MIN_FREE_SPACE_BYTES=10737418240
 RTORRENT_DOWNLOAD_POLL_INTERVAL_SECONDS=30
 RTORRENT_STALL_TIMEOUT_SECONDS=1800
 RTORRENT_DOWNLOAD_TIMEOUT_SECONDS=0
 RTORRENT_POST_COMPLETION_POLICY=stop
 RTORRENT_POST_PROCESS_GRACE_SECONDS=30
 RTORRENT_ALLOWED_FINAL_ROOTS=/srv/media/movies,/srv/media/tv
+SEEDBOX_SSH_HOST=seedbox.example
+SEEDBOX_SSH_PORT=22
+SEEDBOX_USERNAME=seedbox-user
+SEEDBOX_PASSWORD=replace_with_seedbox_password
+SEEDBOX_SSH_TIMEOUT_SECONDS=15
+SEEDBOX_SSH_KNOWN_HOSTS=C:\\Users\\you\\.ssh\\known_hosts
 ```
 
 - `RTORRENT_DOWNLOAD_DIRECTORY` is a dedicated absolute server-side root. It cannot
   be a filesystem root, the user's home, or overlap `RTORRENT_PROBE_DIRECTORY`.
-- `RTORRENT_MIN_FREE_SPACE_BYTES` is the reserve that must remain in addition to the
-  torrent's remaining bytes. The default is `0`; configure a production reserve.
+- `SEEDBOX_SSH_*` and `SEEDBOX_USERNAME` / `SEEDBOX_PASSWORD` configure encrypted
+  SFTP access for all seedbox filesystem operations. The host key must already be in
+  `known_hosts`; Step 6 never accepts an unknown or changed key automatically.
 - `RTORRENT_DOWNLOAD_POLL_INTERVAL_SECONDS` defaults to 30 seconds.
 - `RTORRENT_STALL_TIMEOUT_SECONDS` defaults to 1800 seconds without useful progress.
 - `RTORRENT_DOWNLOAD_TIMEOUT_SECONDS=0` disables the overall timeout.
@@ -522,11 +568,12 @@ RTORRENT_ALLOWED_FINAL_ROOTS=/srv/media/movies,/srv/media/tv
 - `RTORRENT_ALLOWED_FINAL_ROOTS` is a comma-separated allowlist for final paths moved
   outside the download root by trusted post-processing.
 
-The rTorrent process and the Step 6 process must see the configured paths as the same
-filesystem paths. Step 6 can check writability for its own process, but deployment
-permissions must also allow the rTorrent service account to write there.
+All configured rTorrent directories are absolute POSIX paths on the seedbox. Step 6
+runs locally and uses SFTP for remote directory checks, creation, payload-size
+calculation, and FileBot final-path validation. It does not require a mounted seedbox
+filesystem or an SSH shell.
 
-### Permanent directory and disk-space safety
+### Permanent directory and remote-path safety
 
 The destination is deterministic and sanitized:
 
@@ -546,16 +593,9 @@ data exists outside the permanent directory, it is preserved and the command ret
 `PROBE_DATA_RELOCATION_REQUIRED`. An empty probe location is redirected with
 `d.directory.set`, read back for confirmation, and only then started.
 
-Before start, free space must satisfy:
-
-```text
-filesystem free bytes >= remaining torrent bytes + configured reserve
-```
-
-Already completed bytes reduce the remaining-byte requirement. The same check runs
-on every status poll. If space becomes insufficient, the torrent is stopped, its data
-is retained, its named state becomes `PAUSED_LOW_DISK_SPACE`, and the command returns
-`LOW_DISK_SPACE_DURING_DOWNLOAD`.
+Step 6 intentionally does not query or reserve seedbox free space. Capacity is managed
+by the operator. A real rTorrent `disk full` or `no space left` message remains a
+terminal download error.
 
 ### Progress, stalls, timeouts, and restart behavior
 
@@ -610,8 +650,8 @@ removes the torrent or its files.
 
 ### Step 6 commands and JSON
 
-Validate the Step 5 JSON, live torrent identity and metadata, prospective paths, and
-disk space without starting, stopping, tagging, or redirecting the torrent:
+Validate the Step 5 JSON, live torrent identity and metadata, and prospective remote
+paths without starting, stopping, tagging, redirecting, or creating remote directories:
 
 ```powershell
 python -m media_scope.download_torrent `
@@ -657,11 +697,8 @@ error. A shortened, sanitized success result is:
     "release_title": "30 Rock S01-S07 Complete"
   },
   "storage": {
-    "download_directory": "/srv/rtorrent/completed-media-downloads/4608-30-rock-abcdef12",
-    "torrent_size_bytes": 81412969851,
-    "remaining_bytes": 81412969851,
-    "filesystem_free_bytes_at_start": 200000000000,
-    "required_reserve_bytes": 10737418240
+    "protocol": "sftp",
+    "download_directory": "/srv/rtorrent/completed-media-downloads/4608-30-rock-abcdef12"
   },
   "download": {
     "status": "DOWNLOAD_COMPLETED",
@@ -691,8 +728,8 @@ are never serialized. The report contains only the sanitized RPC endpoint.
   Rerun Step 5 so torrent identity and metadata health are validated again.
 - **Probe relocation required:** inspect the retained Step 5 directory and arrange a
   deliberate same-torrent relocation. No verified bytes were discarded.
-- **Insufficient or low disk space:** free space or increase storage, preserving the
-  configured reserve. A low-space torrent remains stopped with all payload retained.
+- **SFTP unavailable or host-key error:** confirm the SSH host, port, credentials, and
+  the expected host key in `SEEDBOX_SSH_KNOWN_HOSTS`. Credentials are never printed.
 - **Stall:** inspect the report's peer and tracker diagnostics. After correcting the
   swarm/network issue, use `--resume-stalled`; otherwise Step 6 will not restart it.
 - **Hash check:** 100% is not final while rTorrent reports hashing. A hash-check
@@ -774,8 +811,8 @@ For `media-download-torrent`:
 | 0 | Download completed and verified for transfer, or dry-run passed |
 | 2 | Invalid command line or malformed Step 5 JSON |
 | 3 | Selected torrent missing, replaced, metadata-only, or invalid |
-| 4 | rTorrent configuration, authentication, RPC, or method failure |
-| 5 | Unsafe path, collision, relocation requirement, or insufficient disk space |
+| 4 | rTorrent or SFTP configuration, authentication, host-key, RPC, or connection failure |
+| 5 | Unsafe path, collision, relocation requirement, or remote pre-download path failure |
 | 6 | Download stalled |
 | 7 | Overall download timeout |
 | 8 | Post-processing or final-path validation failure |
@@ -822,7 +859,7 @@ erases a preexisting torrent, and performs no automatic file cleanup:
 ```powershell
 $env:RUN_RTORRENT_DOWNLOAD_INTEGRATION_TESTS = "true"
 $env:RTORRENT_DOWNLOAD_INTEGRATION_HEALTH_RESULT = "C:\safe\legal-health-result.json"
-$env:RTORRENT_DOWNLOAD_INTEGRATION_DIRECTORY = "C:\safe\rtorrent-download-test"
+$env:RTORRENT_DOWNLOAD_INTEGRATION_DIRECTORY = "/home/seedboxer1/rtorrent-download-test"
 python -m pytest tests\test_rtorrent_download_integration.py -v -s
 ```
 
@@ -833,8 +870,7 @@ python -m pytest tests\test_rtorrent_download_integration.py -v -s
 - Only standard TMDb season ordering is supported.
 - Step 6 deliberately returns `PROBE_DATA_RELOCATION_REQUIRED` instead of attempting
   automatic relocation when Step 5 has already written meaningful payload data.
-- On-disk checks require the Step 6 process to see rTorrent's server-side paths. A
-  remote-only RPC deployment needs Step 6 to run on that server or share its mounts.
+- Step 6 requires SFTP access and a verified SSH host key for remote filesystem checks.
 - Existing completion hooks must update rTorrent's visible base path within the grace
   period for moved files to be discovered automatically.
 - TMDb has no authoritative season-completion status. The returning-series mode is

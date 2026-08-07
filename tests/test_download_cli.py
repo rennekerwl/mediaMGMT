@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from media_scope.download_cli import main
-from media_scope.download_directories import DownloadDirectoryManager
+from tests.fake_remote_filesystem import FakeRemoteFilesystem
 from tests.test_download_input import health_result
 from tests.test_download_service import FakeDownloadClient, snapshot
 
@@ -39,14 +39,20 @@ def write_health(path: Path) -> Path:
 
 def configure(monkeypatch: Any, root: Path) -> None:
     monkeypatch.setenv("RTORRENT_RPC_URL", "http://rtorrent.test/RPC")
-    monkeypatch.setenv("RTORRENT_DOWNLOAD_DIRECTORY", str(root.resolve()))
-    monkeypatch.setenv("RTORRENT_MIN_FREE_SPACE_BYTES", "0")
+    monkeypatch.setenv("RTORRENT_DOWNLOAD_DIRECTORY", "/downloads")
     monkeypatch.setenv("RTORRENT_POST_PROCESS_GRACE_SECONDS", "0")
 
 
 def factory_for(client: CliFakeDownloadClient) -> Any:
     def factory(*_args: Any, **_kwargs: Any) -> CliFakeDownloadClient:
         return client
+
+    return factory
+
+
+def filesystem_factory(filesystem: FakeRemoteFilesystem) -> Any:
+    def factory(*_args: Any, **_kwargs: Any) -> FakeRemoteFilesystem:
+        return filesystem
 
     return factory
 
@@ -80,6 +86,7 @@ def test_dry_run_contacts_rtorrent_but_never_mutates(
     code = main(
         ["--health-result", str(write_health(tmp_path / "health.json")), "--dry-run"],
         client_factory=factory_for(client),
+        filesystem_factory=filesystem_factory(FakeRemoteFilesystem()),
     )
     payload = json.loads(capsys.readouterr().out)
     assert code == 0
@@ -97,14 +104,13 @@ def test_success_stdout_matches_output_and_logs_only_to_stderr(
     root = tmp_path / "downloads"
     configure(monkeypatch, root)
     target = (root / "4608-30-rock-aaaaaaaa").resolve()
-    payload_path = target / "payload"
-    payload_path.mkdir(parents=True)
-    (payload_path / "episode.mkv").write_bytes(b"done")
     client = CliFakeDownloadClient(
         "http://rtorrent.test/RPC",
         snapshots=[snapshot(target, completed=100, complete=True, rate=0)],
     )
     output = tmp_path / "download.json"
+    filesystem = FakeRemoteFilesystem()
+    filesystem.add_file("/downloads/4608-30-rock-aaaaaaaa/payload/episode.mkv", size=4)
     code = main(
         [
             "--health-result",
@@ -115,6 +121,7 @@ def test_success_stdout_matches_output_and_logs_only_to_stderr(
             "--verbose",
         ],
         client_factory=factory_for(client),
+        filesystem_factory=filesystem_factory(filesystem),
     )
     captured = capsys.readouterr()
     parsed = json.loads(captured.out)
@@ -135,6 +142,7 @@ def test_missing_torrent_uses_exit_three(tmp_path: Path, capsys: Any, monkeypatc
     code = main(
         ["--health-result", str(write_health(tmp_path / "health.json"))],
         client_factory=factory_for(client),
+        filesystem_factory=filesystem_factory(FakeRemoteFilesystem()),
     )
     payload = json.loads(capsys.readouterr().out)
     assert (code, payload["error_code"]) == (3, "SELECTED_TORRENT_NOT_FOUND")
@@ -178,32 +186,28 @@ def test_stalled_download_is_valid_json_exit_six(
             "1",
         ],
         client_factory=factory_for(client),
+        filesystem_factory=filesystem_factory(FakeRemoteFilesystem()),
     )
     payload = json.loads(capsys.readouterr().out)
     assert (code, payload["error_code"]) == (6, "DOWNLOAD_STALLED")
     assert payload["ready_for_transfer"] is False
 
 
-def test_low_disk_download_is_valid_json_exit_five(
-    tmp_path: Path, capsys: Any, monkeypatch: Any
-) -> None:
+def test_legacy_disk_reserve_is_ignored(tmp_path: Path, capsys: Any, monkeypatch: Any) -> None:
     root = tmp_path / "downloads"
     configure(monkeypatch, root)
+    monkeypatch.setenv("RTORRENT_MIN_FREE_SPACE_BYTES", "999999999999")
     target = (root / "4608-30-rock-aaaaaaaa").resolve()
     client = CliFakeDownloadClient(
         "http://rtorrent.test/RPC",
-        snapshots=[snapshot(target, active=False, rate=0), snapshot(target, completed=1)],
+        snapshots=[snapshot(target, completed=100, complete=True, rate=0)],
     )
-    free_values = iter([10_000, 0])
-    monkeypatch.setattr(
-        DownloadDirectoryManager,
-        "free_bytes",
-        lambda _self: next(free_values),
-    )
+    filesystem = FakeRemoteFilesystem()
+    filesystem.add_file("/downloads/4608-30-rock-aaaaaaaa/payload/episode.mkv")
     code = main(
         ["--health-result", str(write_health(tmp_path / "health.json"))],
         client_factory=factory_for(client),
+        filesystem_factory=filesystem_factory(filesystem),
     )
-    payload = json.loads(capsys.readouterr().out)
-    assert (code, payload["error_code"]) == (5, "LOW_DISK_SPACE_DURING_DOWNLOAD")
-    assert payload["status"] == "PAUSED_LOW_DISK_SPACE"
+    assert code == 0
+    assert "filesystem_free_bytes" not in capsys.readouterr().out

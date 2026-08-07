@@ -91,6 +91,16 @@ class TmdbClient:
         """Retrieve one movie's full details."""
         return self._request(f"/movie/{tmdb_id}")
 
+    def get_movie_recommendations(self, tmdb_id: int) -> list[JsonObject]:
+        """Retrieve the first page of recommendations for one movie."""
+        payload = self._request(f"/movie/{tmdb_id}/recommendations", params={"page": 1})
+        results = payload.get("results")
+        if not isinstance(results, list) or not all(isinstance(item, dict) for item in results):
+            raise InvalidResponseError(
+                "TMDb movie recommendations did not contain a valid results list."
+            )
+        return results
+
     def get_tv(self, tmdb_id: int) -> JsonObject:
         """Retrieve one television series' full details."""
         return self._request(f"/tv/{tmdb_id}")
