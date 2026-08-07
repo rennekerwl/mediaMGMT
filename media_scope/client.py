@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from datetime import date
 from typing import Any
 
 import httpx
@@ -101,6 +102,38 @@ class TmdbClient:
             )
         return results
 
+    def discover_movies(
+        self,
+        *,
+        page: int,
+        released_through: date,
+        min_vote_average: float,
+        min_vote_count: int,
+    ) -> list[JsonObject]:
+        """Retrieve one quality-filtered page of released movie discoveries."""
+        if page <= 0:
+            raise ValueError("page must be greater than zero")
+        if not 0 <= min_vote_average <= 10:
+            raise ValueError("min_vote_average must be between zero and ten")
+        if min_vote_count < 0:
+            raise ValueError("min_vote_count cannot be negative")
+        payload = self._request(
+            "/discover/movie",
+            params={
+                "include_adult": False,
+                "include_video": False,
+                "page": page,
+                "primary_release_date.lte": released_through.isoformat(),
+                "sort_by": "vote_average.desc",
+                "vote_average.gte": min_vote_average,
+                "vote_count.gte": min_vote_count,
+            },
+        )
+        results = payload.get("results")
+        if not isinstance(results, list) or not all(isinstance(item, dict) for item in results):
+            raise InvalidResponseError("TMDb movie discovery did not contain a valid results list.")
+        return results
+
     def get_tv(self, tmdb_id: int) -> JsonObject:
         """Retrieve one television series' full details."""
         return self._request(f"/tv/{tmdb_id}")
@@ -120,7 +153,7 @@ class TmdbClient:
         self,
         path: str,
         *,
-        params: dict[str, str | int | bool] | None = None,
+        params: dict[str, str | int | float | bool] | None = None,
     ) -> JsonObject:
         for attempt in range(self.max_retries + 1):
             try:

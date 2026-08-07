@@ -27,20 +27,38 @@ class CliRecommendationClient:
 
     def get_movie_recommendations(self, _tmdb_id: int) -> list[dict[str, Any]]:
         return [
-            candidate(10, "First", 30),
-            candidate(11, "Second", 20),
-            candidate(12, "Third", 10),
+            candidate(10, "First", 30, genre_ids=[28, 12]),
+            candidate(11, "Second", 20, genre_ids=[35]),
         ]
 
+    def discover_movies(
+        self,
+        *,
+        page: int,
+        released_through: date,
+        min_vote_average: float,
+        min_vote_count: int,
+    ) -> list[dict[str, Any]]:
+        return [candidate(12, "Explore", 10, genre_ids=[18])] if page == 1 else []
 
-def candidate(tmdb_id: int, title: str, popularity: float) -> dict[str, Any]:
+
+def candidate(
+    tmdb_id: int,
+    title: str,
+    popularity: float,
+    *,
+    genre_ids: list[int] | None = None,
+) -> dict[str, Any]:
     return {
         "id": tmdb_id,
         "title": title,
         "adult": False,
+        "video": False,
+        "genre_ids": genre_ids or [18],
         "release_date": "2020-06-01",
         "popularity": popularity,
         "vote_average": 7.0,
+        "vote_count": 1000,
     }
 
 
@@ -57,7 +75,7 @@ def configure(
 
 
 @pytest.mark.parametrize("existing_count", [0, 1, 2])
-def test_writes_only_enough_recommendations_to_fill_three(
+def test_always_writes_three_recommendations_below_trigger(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     existing_count: int,
@@ -75,7 +93,7 @@ def test_writes_only_enough_recommendations_to_fill_three(
 
     lines = (tmp_path / "RECOMMENDATIONS.txt").read_text(encoding="utf-8").splitlines()
     assert exit_code == 0
-    assert lines == ["First (2020)", "Second (2020)", "Third (2020)"][: 3 - existing_count]
+    assert lines == ["First (2020)", "Second (2020)", "Explore (2020)"]
 
 
 def test_full_folder_skips_network_and_preserves_output(
@@ -117,7 +135,7 @@ def test_counts_movies_and_writes_recommendations_in_separate_directories(
     assert exit_code == 0
     assert not (movies / "RECOMMENDATIONS.txt").exists()
     assert (tmp_path / "RECOMMENDATIONS.txt").read_text(encoding="utf-8") == (
-        "First (2020)\nSecond (2020)\n"
+        "First (2020)\nSecond (2020)\nExplore (2020)\n"
     )
 
 
@@ -129,6 +147,16 @@ def test_short_result_is_written_with_warning(
     class OneResultClient(CliRecommendationClient):
         def get_movie_recommendations(self, _tmdb_id: int) -> list[dict[str, Any]]:
             return [candidate(10, "Only One", 10)]
+
+        def discover_movies(
+            self,
+            *,
+            page: int,
+            released_through: date,
+            min_vote_average: float,
+            min_vote_count: int,
+        ) -> list[dict[str, Any]]:
+            return []
 
     exit_code = main(
         [],

@@ -19,7 +19,8 @@ from dotenv import load_dotenv
 from media_scope.client import TmdbClient
 from media_scope.exceptions import TmdbError
 from media_scope.recommendations import (
-    MOVIE_TARGET,
+    MOVIE_TRIGGER_COUNT,
+    RECOMMENDATION_COUNT,
     RecommendationClient,
     RecommendationInputError,
     build_recommendations,
@@ -97,7 +98,7 @@ def main(
         LOGGER.exception("Could not inspect MOVIES_DIRECTORY.")
         return 5
 
-    if movie_count >= MOVIE_TARGET:
+    if movie_count >= MOVIE_TRIGGER_COUNT:
         LOGGER.info(
             "Movies folder contains %s entries; no recommendations are needed.", movie_count
         )
@@ -125,7 +126,6 @@ def main(
         LOGGER.error("TMDB_BEARER_TOKEN is missing. Configure it in the environment or .env file.")
         return 2
 
-    gap = MOVIE_TARGET - movie_count
     try:
         ratings = parse_ratings_csv(csv_fetcher(csv_url), LOGGER.warning)
         factory = client_factory or TmdbClient
@@ -133,7 +133,6 @@ def main(
             recommendations = build_recommendations(
                 client,
                 ratings,
-                limit=gap,
                 today=today or date.today(),
                 warn=LOGGER.warning,
             )
@@ -147,11 +146,11 @@ def main(
         LOGGER.exception("Unexpected recommendation failure.")
         return 1
 
-    if len(recommendations) < gap:
+    if len(recommendations) < RECOMMENDATION_COUNT:
         LOGGER.warning(
             "TMDb supplied only %s of the %s requested recommendation(s).",
             len(recommendations),
-            gap,
+            RECOMMENDATION_COUNT,
         )
 
     output = recommendations_directory / RECOMMENDATIONS_FILENAME

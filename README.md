@@ -82,7 +82,8 @@ GOOGLE_SHEET_CSV_URL=https://docs.google.com/spreadsheets/d/.../pub?output=csv
 The CSV requires `Title` and `Rating` columns. `Year` is optional and `Notes` is
 ignored. Ratings are whole numbers: 1 means hated it, 2 disliked it, 3 neutral,
 4 liked it, and 5 loved it. Ratings 4 and 5 seed recommendations, while every
-resolved rated movie is excluded from the output.
+resolved rated movie is excluded from the output. A rating of 5 contributes 1.5
+times the recommendation weight of a rating of 4.
 
 Run one check with either installed entry point:
 
@@ -92,9 +93,16 @@ python -m media_scope.recommend_cli --verbose
 ```
 
 The command counts immediate child directories and top-level video files. Below
-three movies, it writes only enough `Title (Year)` lines to fill the gap to
-`RECOMMENDATIONS.txt` in `RECOMMENDATIONS_DIRECTORY`. At three or more movies, it
-makes no network requests and leaves any existing recommendation file unchanged.
+three movies, it writes three `Title (Year)` lines to `RECOMMENDATIONS.txt` in
+`RECOMMENDATIONS_DIRECTORY`, regardless of whether the folder currently contains
+zero, one, or two movies. At three or more movies, it makes no network requests and
+leaves any existing recommendation file unchanged.
+
+The first result is the strongest rating-weighted personalized match. The second
+prefers a strong personalized match sharing at most one TMDb genre with the first.
+The final line is always an exploration result chosen for low genre overlap from
+released TMDb discoveries with a rating of at least 7.0 and at least 500 votes. If
+the personalized pool is thin, discovery results fill the earlier positions as well.
 
 For Windows Task Scheduler, use `.venv\Scripts\python.exe` as the program,
 `-m media_scope.recommend_cli` as the arguments, and this repository as the
