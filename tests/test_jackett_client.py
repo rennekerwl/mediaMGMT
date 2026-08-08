@@ -142,6 +142,33 @@ def test_search_uses_tvsearch_tv_category_and_cache_bypass() -> None:
     assert values[1].seeders is None
 
 
+def test_movie_search_uses_generic_search_movie_category_and_cache_bypass() -> None:
+    indexer = IndexerCapabilities(
+        "alpha",
+        "Alpha",
+        True,
+        True,
+        (TorznabCategory(2000, "Movies"), TorznabCategory(2040, "Movies/HD")),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["t"] == "search"
+        assert request.url.params["q"] == "The Thing 1982"
+        assert request.url.params["cat"] == "2000"
+        assert request.url.params["cache"] == "false"
+        return httpx.Response(200, content=fixture("results.xml"))
+
+    with client_for(handler) as client:
+        values = client.search_movies(
+            indexer,
+            "The Thing 1982",
+            fresh=True,
+            sequence_start=4,
+        )
+    assert values[0].sequence == 4
+    assert indexer.supports_movie_category
+
+
 def test_missing_optional_fields_and_link_only_result_do_not_crash() -> None:
     xml = b"""<rss><channel><item>
       <title>Example.Show.Complete.Series</title>
