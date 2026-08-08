@@ -76,6 +76,14 @@ class FakeRemoteFilesystem:
             return info.size_bytes
         return sum(self.tree_size(item.path) for item in self.listdir(path) if not item.is_symlink)
 
+    def remove_tree(self, path: PurePosixPath) -> None:
+        self.calls.append(("remove_tree", str(path)))
+        info = self.lstat(path)
+        if info.is_directory and not info.is_symlink:
+            for item in list(self.listdir(path)):
+                self.remove_tree(item.path)
+        self.entries.pop(path)
+
     def add_file(self, path: str | PurePosixPath, *, size: int = 7) -> PurePosixPath:
         remote = PurePosixPath(path)
         self.mkdirs(remote.parent)

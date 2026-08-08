@@ -183,7 +183,6 @@ class JackettClient:
         parts = urlsplit(url)
         if parts.scheme.casefold() not in {"http", "https"} or not parts.hostname:
             raise JackettConfigurationError("Acquisition reference must be an HTTP(S) URL.")
-
         for attempt in range(4):
             try:
                 with self._client.stream("GET", url) as response:
@@ -232,6 +231,29 @@ class JackettClient:
                 delay = float(2**attempt)
             self._sleep(delay)
         raise JackettNetworkError("Jackett acquisition resolution failed unexpectedly.")
+
+    def authenticate_acquisition_reference(self, url: str) -> str:
+        """Restore the configured key to one serialized same-origin Jackett URL."""
+        parts = urlsplit(url)
+        base = urlsplit(self.base_url)
+        if (
+            parts.scheme.casefold() not in {"http", "https"}
+            or not parts.hostname
+            or (parts.scheme.casefold(), parts.hostname.casefold(), parts.port)
+            != (base.scheme.casefold(), (base.hostname or "").casefold(), base.port)
+        ):
+            raise JackettConfigurationError(
+                "Acquisition reference must use the configured Jackett origin."
+            )
+        query = [
+            (key, value)
+            for key, value in parse_qsl(parts.query, keep_blank_values=True)
+            if key.casefold() not in _SECRET_QUERY_KEYS
+        ]
+        query.append(("apikey", self._api_key))
+        return urlunsplit(
+            (parts.scheme, parts.netloc, parts.path, urlencode(query, doseq=True), parts.fragment)
+        )
 
     def contains_configured_api_key(self, value: str) -> bool:
         """Return whether text contains the configured Jackett API key."""

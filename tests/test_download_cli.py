@@ -151,6 +151,7 @@ def test_missing_torrent_uses_exit_three(tmp_path: Path, capsys: Any, monkeypatc
 def test_password_is_never_serialized_or_logged(
     tmp_path: Path, capsys: Any, monkeypatch: Any
 ) -> None:
+    monkeypatch.setattr("media_scope.download_cli.load_dotenv", lambda: False)
     monkeypatch.setenv("RTORRENT_RPC_PASSWORD", "never-print-this")
     monkeypatch.delenv("RTORRENT_RPC_URL", raising=False)
     monkeypatch.setenv("RTORRENT_DOWNLOAD_DIRECTORY", str((tmp_path / "downloads").resolve()))
