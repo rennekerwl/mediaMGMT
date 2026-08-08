@@ -87,6 +87,11 @@ class IndexerCapabilities:
         """Return whether standard Torznab TV category 5000 is advertised."""
         return any(category.id == 5000 for category in self.categories)
 
+    @property
+    def supports_movie_category(self) -> bool:
+        """Return whether a standard Torznab movie category is advertised."""
+        return any(2000 <= category.id < 3000 for category in self.categories)
+
     def category_name(self, category_id: int) -> str | None:
         """Resolve an advertised category name."""
         return next(

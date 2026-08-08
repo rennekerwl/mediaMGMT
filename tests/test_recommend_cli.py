@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -77,6 +78,7 @@ def configure(
 @pytest.mark.parametrize("existing_count", [0, 1, 2])
 def test_always_writes_three_recommendations_below_trigger(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
     tmp_path: Path,
     existing_count: int,
 ) -> None:
@@ -92,12 +94,24 @@ def test_always_writes_three_recommendations_below_trigger(
     )
 
     lines = (tmp_path / "RECOMMENDATIONS.txt").read_text(encoding="utf-8").splitlines()
+    payload = json.loads(capsys.readouterr().out)
     assert exit_code == 0
     assert lines == ["First (2020)", "Second (2020)", "Explore (2020)"]
+    assert payload == {
+        "schema_version": 1,
+        "result": "recommendations_created",
+        "recommendations": [
+            {"tmdb_id": 10, "title": "First", "year": 2020},
+            {"tmdb_id": 11, "title": "Second", "year": 2020},
+            {"tmdb_id": 12, "title": "Explore", "year": 2020},
+        ],
+    }
 
 
 def test_full_folder_skips_network_and_preserves_output(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
 ) -> None:
     configure(monkeypatch, tmp_path)
     for index in range(3):
@@ -115,6 +129,11 @@ def test_full_folder_skips_network_and_preserves_output(
 
     assert exit_code == 0
     assert output.read_text(encoding="utf-8") == "old contents\n"
+    assert json.loads(capsys.readouterr().out) == {
+        "schema_version": 1,
+        "result": "recommendations_not_needed",
+        "recommendations": [],
+    }
 
 
 def test_counts_movies_and_writes_recommendations_in_separate_directories(

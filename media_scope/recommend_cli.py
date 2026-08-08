@@ -18,9 +18,11 @@ from dotenv import load_dotenv
 
 from media_scope.client import TmdbClient
 from media_scope.exceptions import TmdbError
+from media_scope.models import JsonObject
 from media_scope.recommendations import (
     MOVIE_TRIGGER_COUNT,
     RECOMMENDATION_COUNT,
+    Recommendation,
     RecommendationClient,
     RecommendationInputError,
     build_recommendations,
@@ -28,7 +30,7 @@ from media_scope.recommendations import (
     format_recommendations,
     parse_ratings_csv,
 )
-from media_scope.serialization import configure_utf8_stdio
+from media_scope.serialization import configure_utf8_stdio, serialize_json
 
 LOGGER = logging.getLogger("media_scope.recommend")
 RECOMMENDATIONS_FILENAME = "RECOMMENDATIONS.txt"
@@ -102,6 +104,7 @@ def main(
         LOGGER.info(
             "Movies folder contains %s entries; no recommendations are needed.", movie_count
         )
+        sys.stdout.write(serialize_json(_recommendation_payload([], needed=False)))
         return 0
 
     recommendations_text = os.getenv("RECOMMENDATIONS_DIRECTORY", "").strip()
@@ -177,7 +180,25 @@ def main(
         return 5
 
     LOGGER.info("Wrote %s recommendation(s) to %s.", len(recommendations), output)
+    sys.stdout.write(serialize_json(_recommendation_payload(recommendations, needed=True)))
     return 0
+
+
+def _recommendation_payload(
+    recommendations: Sequence[Recommendation],
+    *,
+    needed: bool,
+) -> JsonObject:
+    """Build the stable machine handoff for the movie-search stage."""
+    values: list[JsonObject] = [
+        {"tmdb_id": item.tmdb_id, "title": item.title, "year": item.year}
+        for item in recommendations
+    ]
+    return {
+        "schema_version": 1,
+        "result": "recommendations_created" if needed else "recommendations_not_needed",
+        "recommendations": values,
+    }
 
 
 if __name__ == "__main__":

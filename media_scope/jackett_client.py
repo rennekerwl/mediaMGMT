@@ -149,6 +149,30 @@ class JackettClient:
             sequence_start=sequence_start,
         )
 
+    def search_movies(
+        self,
+        indexer: IndexerCapabilities,
+        query: str,
+        *,
+        fresh: bool,
+        sequence_start: int,
+    ) -> list[RawRelease]:
+        """Run one generic movie-category search against one indexer."""
+        if not indexer.search_available:
+            raise JackettApiError(f"Indexer {indexer.id} does not support generic search.")
+        if not indexer.supports_movie_category:
+            raise JackettApiError(f"Indexer {indexer.id} does not advertise movie categories.")
+        params = {"t": "search", "q": query, "cat": "2000"}
+        if fresh:
+            params["cache"] = "false"
+        content = self._get_xml(indexer.id, params)
+        return parse_torznab_results(
+            content,
+            indexer=indexer,
+            query=query,
+            sequence_start=sequence_start,
+        )
+
     def fetch_acquisition_reference(
         self,
         url: str,

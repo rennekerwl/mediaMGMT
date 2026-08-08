@@ -1,6 +1,6 @@
 # media-scope
 
-`media-scope` is a deterministic Python media-management project with four independent
+`media-scope` is a deterministic Python media-management project with five independent
 components:
 
 - `media-scope` identifies an exact released movie, a complete ended television
@@ -12,6 +12,8 @@ components:
   retrieve magnet metadata, stopping after the first live candidate succeeds.
 - `media-recommend` performs one movies-folder check and writes a short TMDb
   recommendation list when fewer than three movies are present.
+- `python -m media_scope.movie_search` consumes those recommendations and returns
+  ranked, title-matched movie results from configured Jackett indexers.
 
 Its scope is intentionally narrow. It does not scrape websites, inspect torrent file
 lists, transfer files, or run a continuous folder-monitoring service. The Jackett
@@ -25,7 +27,7 @@ infohash.
 - Python 3.12 or newer
 - A TMDb API Read Access Token for scope generation
 - A published Google Sheet CSV for movie recommendations
-- A running, user-configured Jackett service for complete-series searches
+- A running, user-configured Jackett service for movie and complete-series searches
 - A running rTorrent instance exposed through a user-secured HTTP(S) XML-RPC gateway
   for live health probes
 
@@ -98,6 +100,11 @@ three movies, it writes three `Title (Year)` lines to `RECOMMENDATIONS.txt` in
 zero, one, or two movies. At three or more movies, it makes no network requests and
 leaves any existing recommendation file unchanged.
 
+On success, the command also writes a compact JSON handoff to standard output. It
+contains `tmdb_id`, `title`, and `year` for each recommendation. When recommendations
+are not needed, it emits `recommendations_not_needed` with an empty list. Logs and
+errors remain on standard error so the JSON can be piped directly to the next stage.
+
 The first result is the strongest rating-weighted personalized match. The second
 prefers a strong personalized match sharing at most one TMDb genre with the first.
 The final line is always an exploration result chosen for low genre overlap from
@@ -135,6 +142,43 @@ removed from serialized result URLs.
 
 `MEDIA_SEARCH_MIN_SEEDERS` is a ranking preference, not an acceptance filter. A
 correctly scoped zero-seeder release remains a candidate.
+
+## Recommended-movie Jackett search
+
+Pipe the structured recommendation output directly into the movie-search stage:
+
+```powershell
+media-recommend | python -m media_scope.movie_search
+```
+
+The movie-search stage reads one recommendation JSON document from standard input.
+For every recommendation it queries each configured, movie-capable Jackett indexer
+with `Title Year` in Torznab movie category `2000`. `JACKETT_INDEXERS` restricts the
+indexers when configured; otherwise every compatible configured indexer is used.
+
+Results must contain the recommendation title as a contiguous normalized token
+sequence, the exact recommendation year, a usable acquisition reference, and a
+reported seeder count greater than zero. Duplicate infohashes are merged across
+indexers; when no hash is available, exact normalized release title plus byte size is
+used. Results are ranked by title position, reported seeders and peers, source count,
+and publication date, with at most ten returned per movie.
+
+The resulting JSON is written to standard output for the next pipeline stage. A safe,
+human-readable view is atomically written to `JACKETTRESULTS.txt` in
+`RECOMMENDATIONS_DIRECTORY`. It includes direct magnet URIs supplied by Jackett for
+validation and debugging, but omits Jackett download URLs. Jackett API-key parameters
+are removed from serialized URLs.
+
+Jackett's normal search cache is used by default. Add `--fresh` to bypass it for a
+deliberate manual refresh, `--pretty` to indent JSON, or `--verbose` for diagnostics:
+
+```powershell
+media-recommend | python -m media_scope.movie_search --fresh --pretty
+```
+
+Seeder and peer counts are only the values reported by the indexer. This stage does
+not contact trackers, query DHT, or claim that a torrent is currently healthy; that
+validation belongs to the following workflow stage.
 
 ## Usage
 
