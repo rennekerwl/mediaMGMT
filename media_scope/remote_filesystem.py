@@ -41,6 +41,8 @@ class RemoteFilesystem(Protocol):
 
     def tree_size(self, path: PurePosixPath) -> int: ...
 
+    def remove_tree(self, path: PurePosixPath) -> None: ...
+
 
 class SftpRemoteFilesystem:
     """Lazy, host-key-verified SFTP client with reconnect-on-next-operation behavior."""
@@ -164,6 +166,16 @@ class SftpRemoteFilesystem:
         return sum(
             0 if child.is_symlink else self.tree_size(child.path) for child in self.listdir(path)
         )
+
+    def remove_tree(self, path: PurePosixPath) -> None:
+        """Remove one remote tree without following symlinks."""
+        info = self.lstat(path)
+        if info.is_directory and not info.is_symlink:
+            for child in self.listdir(path):
+                self.remove_tree(child.path)
+            self._call(lambda sftp: sftp.rmdir(str(path)), retry=False)
+            return
+        self._call(lambda sftp: sftp.remove(str(path)), retry=False)
 
     def _ensure_connected(self) -> object:
         if self._sftp is not None:

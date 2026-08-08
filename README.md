@@ -1,7 +1,7 @@
 # media-scope
 
-`media-scope` is a deterministic Python media-management project with five independent
-components:
+`media-scope` is a deterministic Python media-management project with independent
+workflow components:
 
 - `media-scope` identifies an exact released movie, a complete ended television
   series, or the latest conservatively completed season of a returning series through
@@ -14,6 +14,8 @@ components:
   recommendation list when fewer than three movies are present.
 - `python -m media_scope.movie_search` consumes those recommendations and returns
   ranked, title-matched movie results from configured Jackett indexers.
+- `media-probe-movies` consumes the movie results and selects the first torrent whose
+  metadata the remote rTorrent seedbox can retrieve.
 
 Its scope is intentionally narrow. It does not scrape websites, inspect torrent file
 lists, transfer files, or run a continuous folder-monitoring service. The Jackett
@@ -179,6 +181,32 @@ media-recommend | python -m media_scope.movie_search --fresh --pretty
 Seeder and peer counts are only the values reported by the indexer. This stage does
 not contact trackers, query DHT, or claim that a torrent is currently healthy; that
 validation belongs to the following workflow stage.
+
+## Recommended-movie torrent validation
+
+Pipe the movie-search JSON into the separate validation stage running on the Windows
+desktop:
+
+```powershell
+media-recommend | python -m media_scope.movie_search | python -m media_scope.movie_probe
+```
+
+The validator processes recommendations in order and each movie's results by rank. It
+uses a direct magnet when available, constructs one from an infohash, or resolves a
+same-origin Jackett download URL. Private or unresolvable results are skipped. At most
+`RTORRENT_PROBE_MAX_CANDIDATES` resolved torrents are submitted to the remote rTorrent
+instance; the first torrent whose metadata arrives is stopped, retained, and returned
+as `READY_FOR_DOWNLOAD`. Failed probes are erased.
+
+The script uses the existing `RTORRENT_RPC_*`, `RTORRENT_PROBE_*`, `JACKETT_*`, and
+`SEEDBOX_SSH_*` settings from `.env`. Probe directories are remote POSIX paths managed
+through SFTP, so no seedbox filesystem mount is required on Windows. JSON is written to
+standard output for the next stage and the exact same JSON is atomically mirrored to
+`TORRENTVALIDATION.txt` in `RECOMMENDATIONS_DIRECTORY`. Add `--pretty` for indented JSON
+or `--verbose` for diagnostics on standard error.
+
+This MVP validates live metadata retrieval only. It does not inspect the torrent file
+list or validate movie content, codecs, or resolution.
 
 ## Usage
 

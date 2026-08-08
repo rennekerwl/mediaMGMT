@@ -273,9 +273,7 @@ def test_stops_after_first_healthy_and_reports_lower_candidates_unattempted() ->
 
 def test_candidate_limit_leaves_extra_candidates_unattempted() -> None:
     client = FakeRtorrent({HASH_A: [metadata(False)], HASH_B: [metadata(True)]})
-    payload, code = run_service(
-        make_service(client, maximum=1), candidate(1), candidate(2, HASH_B)
-    )
+    payload, code = run_service(make_service(client, maximum=1), candidate(1), candidate(2, HASH_B))
     assert code == 6
     assert len(payload["attempts"]) == 1
     assert payload["unattempted_candidates"][0]["original_rank"] == 2

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import xmlrpc.client
+from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx

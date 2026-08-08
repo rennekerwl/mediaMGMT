@@ -26,6 +26,7 @@ media-search-tv = "media_scope.search_cli:main"
 media-probe-torrents = "media_scope.probe_cli:main"
 media-download-torrent = "media_scope.download_cli:main"
 media-recommend = "media_scope.recommend_cli:main"
+media-probe-movies = "media_scope.movie_probe:main"
 
 [tool.setuptools.packages.find]
 include = ["media_scope*"]
