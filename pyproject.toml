@@ -25,6 +25,7 @@ media-scope = "media_scope.cli:main"
 media-search-tv = "media_scope.search_cli:main"
 media-probe-torrents = "media_scope.probe_cli:main"
 media-download-torrent = "media_scope.download_cli:main"
+media-transfer-movie = "media_scope.transfer_cli:main"
 media-recommend = "media_scope.recommend_cli:main"
 media-probe-movies = "media_scope.movie_probe:main"
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 from media_scope.remote_filesystem import RemotePathInfo
 
@@ -75,6 +75,13 @@ class FakeRemoteFilesystem:
         if info.is_file:
             return info.size_bytes
         return sum(self.tree_size(item.path) for item in self.listdir(path) if not item.is_symlink)
+
+    def download_file(self, source: PurePosixPath, destination: Path) -> None:
+        self.calls.append(("download_file", f"{source} -> {destination}"))
+        info = self.lstat(source)
+        if not info.is_file or info.is_symlink:
+            raise OSError("not a regular file")
+        destination.write_bytes(b"x" * info.size_bytes)
 
     def rename(self, source: PurePosixPath, destination: PurePosixPath) -> None:
         self.calls.append(("rename", f"{source} -> {destination}"))

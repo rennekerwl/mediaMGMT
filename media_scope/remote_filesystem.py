@@ -23,7 +23,7 @@ class RemotePathInfo:
 
 
 class RemoteFilesystem(Protocol):
-    """Operations Step 6 needs without assuming a locally mounted seedbox."""
+    """Seedbox operations that do not assume a locally mounted filesystem."""
 
     def close(self) -> None: ...
 
@@ -40,6 +40,8 @@ class RemoteFilesystem(Protocol):
     def listdir(self, path: PurePosixPath) -> list[RemotePathInfo]: ...
 
     def tree_size(self, path: PurePosixPath) -> int: ...
+
+    def download_file(self, source: PurePosixPath, destination: Path) -> None: ...
 
     def rename(self, source: PurePosixPath, destination: PurePosixPath) -> None: ...
 
@@ -167,6 +169,16 @@ class SftpRemoteFilesystem:
             return 0
         return sum(
             0 if child.is_symlink else self.tree_size(child.path) for child in self.listdir(path)
+        )
+
+    def download_file(self, source: PurePosixPath, destination: Path) -> None:
+        """Download one regular file without retrying an ambiguous partial write."""
+        info = self.lstat(source)
+        if not info.is_file or info.is_symlink:
+            self._storage_error("The requested SFTP source is not a regular file.")
+        self._call(
+            lambda sftp: sftp.get(str(source), str(destination)),
+            retry=False,
         )
 
     def rename(self, source: PurePosixPath, destination: PurePosixPath) -> None:

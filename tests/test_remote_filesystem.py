@@ -14,8 +14,18 @@ from media_scope.remote_filesystem import SftpRemoteFilesystem
 
 
 class FakeSftp:
+    def __init__(self) -> None:
+        self.downloads: list[tuple[str, str]] = []
+
     def normalize(self, value: str) -> str:
         return "/home/seedboxer1" if value == "." else value
+
+    def lstat(self, _value: str) -> SimpleNamespace:
+        return SimpleNamespace(st_mode=0o100600, st_size=4)
+
+    def get(self, source: str, destination: str) -> None:
+        self.downloads.append((source, destination))
+        Path(destination).write_bytes(b"data")
 
     def close(self) -> None:
         pass
@@ -26,6 +36,7 @@ class FakeClient:
         self.failure = failure
         self.connected: dict[str, Any] | None = None
         self.policy: object | None = None
+        self.sftp = FakeSftp()
 
     def load_system_host_keys(self) -> None:
         pass
@@ -42,7 +53,7 @@ class FakeClient:
         self.connected = kwargs
 
     def open_sftp(self) -> FakeSftp:
-        return FakeSftp()
+        return self.sftp
 
     def close(self) -> None:
         pass
@@ -91,6 +102,25 @@ def test_sftp_uses_password_auth_and_verified_host_policy(
     assert client.connected["allow_agent"] is False
     assert client.connected["password"] == "secret"
     assert client.policy is not None
+
+
+def test_sftp_downloads_one_regular_file_directly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = FakeClient()
+    install_fake_paramiko(monkeypatch, client)
+    filesystem = SftpRemoteFilesystem(
+        "seedbox.test",
+        port=22,
+        username="user",
+        password="secret",
+    )
+    destination = tmp_path / "movie.mkv"
+
+    filesystem.download_file(PurePosixPath("/downloads/movie.mkv"), destination)
+
+    assert destination.read_bytes() == b"data"
+    assert client.sftp.downloads == [("/downloads/movie.mkv", str(destination))]
 
 
 def test_sftp_authentication_failure_is_sanitized(monkeypatch: pytest.MonkeyPatch) -> None:
