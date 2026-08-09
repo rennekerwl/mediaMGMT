@@ -207,6 +207,100 @@ To transfer the completed movie locally and clean it from the seedbox, append St
 media-recommend | python -m media_scope.movie_search | python -m media_scope.movie_probe | media-download-torrent | media-transfer-movie
 ```
 
+## Checkpointed movie-flow orchestration
+
+`media-movie-flow` runs the same movie stages through their existing JSON standard
+input/output contracts, while saving every handoff and stderr log. Only one flow is
+active at a time. By default its state is stored under
+`RECOMMENDATIONS_DIRECTORY\movie-flow`; set `MOVIE_FLOW_DIRECTORY` to use another
+local directory.
+
+Run or inspect the flow manually:
+
+```powershell
+media-movie-flow run --pretty
+media-movie-flow status --pretty
+```
+
+Each run has a unique directory beneath `runs`, plus a versioned `manifest.json`.
+`latest-status.json` is an atomic copy of the newest status. Completed artifacts are
+never automatically deleted. A second `run` exits successfully with
+`flow_already_running` when another process owns the flow lock.
+
+Recommendation and search failures that are safe to repeat remain retryable. An
+interrupted download is restarted from its saved probe handoff and uses Step 6's
+existing deterministic job identity. An interrupted probe or transfer, a stalled or
+unsafe download, and every transfer failure stop as `ATTENTION_REQUIRED` because
+external state may need inspection.
+
+After correcting a resumable download or transfer problem, use the run ID reported by
+`status`:
+
+```powershell
+media-movie-flow resume --run-id movie-flow-20260809T120000Z-1234abcd --pretty
+```
+
+If a blocked run has been resolved manually and should no longer prevent a new
+acquisition, acknowledge it explicitly:
+
+```powershell
+media-movie-flow clear `
+  --run-id movie-flow-20260809T120000Z-1234abcd `
+  --reason "Removed the interrupted probe from rTorrent" `
+  --pretty
+```
+
+`clear` changes only orchestration state. It never removes torrents, local or remote
+files, or run history. A `transfer_completed_cleanup_failed` result cannot be resumed;
+complete its reported seedbox cleanup manually and then clear the run.
+
+The orchestrator uses these process exit codes:
+
+| Code | Meaning |
+| ---: | --- |
+| 0 | Completed, no action/candidate, already running, status, or clear succeeded |
+| 2 | Invalid command, configuration, or persisted manifest |
+| 3 | Operator attention is required |
+| 4 | A child-stage failure is safe to retry on the next scheduled invocation |
+| 5 | Unexpected orchestration or persistence failure |
+
+### Windows Task Scheduler
+
+The included installer registers an idempotent current-user task that starts at logon
+and uses a daily trigger that repeats every 15 minutes for 24 hours, renewing each
+day. It runs only while that user is logged in, ignores
+overlapping instances, has no execution-time limit, and preserves missed starts until
+the task can run. Preview it without changing Task Scheduler:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\scripts\install_movie_flow_task.ps1 -DryRun
+```
+
+Install or update the default task, optionally choosing another interval:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\scripts\install_movie_flow_task.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\scripts\install_movie_flow_task.ps1 -IntervalMinutes 30
+```
+
+Remove only the scheduled task—the flow history and all media remain untouched:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\scripts\install_movie_flow_task.ps1 -Remove
+```
+
+The task invokes the repository's absolute `.venv\Scripts\python.exe`, passes
+`-m media_scope.movie_flow run`, and uses the repository as its working directory.
+The virtual environment must therefore exist before installation. Because the task
+uses the current user's interactive token, it begins after Windows logon rather than
+before login and cannot continue while that user is logged out. Check
+`latest-status.json`, the per-stage logs, the command exit code in Task Scheduler, and
+Task Scheduler History when troubleshooting.
+
 The validator processes recommendations in order and each movie's results by rank. It
 uses a direct magnet when available, constructs one from an infohash, or resolves a
 same-origin Jackett download URL. Private or unresolvable results are skipped. At most
