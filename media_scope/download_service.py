@@ -19,6 +19,7 @@ from media_scope.download_models import (
     HealthDownloadInput,
 )
 from media_scope.exceptions import (
+    DownloadError,
     DownloadPostProcessingError,
     DownloadStorageError,
     RtorrentError,
@@ -30,6 +31,9 @@ LOGGER = logging.getLogger("media_scope.download")
 Monotonic = Callable[[], float]
 Sleeper = Callable[[float], None]
 WallClock = Callable[[], datetime]
+RTORRENT_STARTUP_SETTLE_SECONDS = 2
+RTORRENT_ACTIVATION_ATTEMPTS = 5
+RTORRENT_STARTUP_CYCLES = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +81,7 @@ class TorrentDownloadService:
         self.wall_clock = wall_clock
         self.record = DownloadRecord()
         self.latest_snapshot: DownloadSnapshot | None = None
+        self._probe_handoff_cleanup: tuple[PurePosixPath, PurePosixPath] | None = None
 
     def run(
         self,
@@ -128,12 +133,20 @@ class TorrentDownloadService:
 
             self.record.transition(DownloadState.PREPARING_DIRECTORY, self._timestamp())
             current_directory = _safe_remote_path(initial.directory)
-            owned = (
-                previous_job == self.job_id or current_directory == self.directories.job_directory
+            owned = previous_job == self.job_id or _registered_download_directory(
+                current_directory,
+                self.directories.job_directory,
+                initial.name,
             )
             target = self.directories.prepare(existing_owner=owned, dry_run=dry_run)
-            initial = self._prepare_torrent(initial, target, dry_run=dry_run)
+            initial = self._prepare_torrent(
+                initial,
+                target,
+                probe_job_id=health.probe_job_id,
+                dry_run=dry_run,
+            )
             self.latest_snapshot = initial
+            base_before_download = initial.base_path
 
             if dry_run:
                 return (
@@ -152,16 +165,17 @@ class TorrentDownloadService:
             if self._is_complete(initial):
                 completed = initial
             else:
+                if not initial.hashing and not initial.is_active:
+                    self.record.transition(DownloadState.STARTING, self._timestamp())
+                    self.client.set_download_state(candidate.infohash, DownloadState.STARTING.value)
+                    initial = self._start_or_resume(initial)
+                    self.latest_snapshot = initial
                 if initial.hashing:
                     self.record.transition(DownloadState.HASH_CHECKING, self._timestamp())
                     self.client.set_download_state(
                         candidate.infohash, DownloadState.HASH_CHECKING.value
                     )
-                elif not initial.is_active:
-                    self.record.transition(DownloadState.STARTING, self._timestamp())
-                    self.client.set_download_state(candidate.infohash, DownloadState.STARTING.value)
-                    self.client.start(candidate.infohash)
-                if not initial.hashing:
+                else:
                     self.record.transition(DownloadState.DOWNLOADING, self._timestamp())
                     self.client.set_download_state(
                         candidate.infohash, DownloadState.DOWNLOADING.value
@@ -173,7 +187,7 @@ class TorrentDownloadService:
                 capabilities,
                 storage,
                 started,
-                initial.base_path,
+                base_before_download,
             )
         except RuntimeFailure as exc:
             return (
@@ -214,11 +228,28 @@ class TorrentDownloadService:
         snapshot: DownloadSnapshot,
         target: PurePosixPath,
         *,
+        probe_job_id: str | None,
         dry_run: bool,
     ) -> DownloadSnapshot:
         current = _safe_remote_path(snapshot.directory)
-        if current == target:
+        if _registered_download_directory(current, target, snapshot.name):
             return snapshot
+        probe_handoff = self._owned_probe_handoff_paths(
+            current,
+            probe_job_id,
+            snapshot.infohash,
+        )
+        if probe_handoff is not None and (snapshot.is_active or snapshot.state != 0):
+            self.client.stop(snapshot.infohash)
+            if not self._wait_for_rtorrent(
+                lambda: self.client.download_state(snapshot.infohash) == 0
+                and not self.client.is_active(snapshot.infohash)
+            ):
+                return self._startup_failure(snapshot, "probe-stop")
+            snapshot = self.client.download_snapshot(snapshot.infohash)
+            self.latest_snapshot = snapshot
+            self._validate_identity(snapshot, snapshot.infohash)
+            current = _safe_remote_path(snapshot.directory)
         base_path = _safe_remote_path(snapshot.base_path)
         on_disk_bytes = 0
         if base_path is not None and self.directories.filesystem.exists(base_path):
@@ -230,7 +261,7 @@ class TorrentDownloadService:
             and self.directories.filesystem.exists(current)
         ):
             on_disk_bytes = max(on_disk_bytes, self.directories.on_disk_size(current))
-        if snapshot.completed_bytes > 0 or on_disk_bytes > 0:
+        if probe_handoff is None and (snapshot.completed_bytes > 0 or on_disk_bytes > 0):
             raise RuntimeFailure(
                 "PROBE_DATA_RELOCATION_REQUIRED",
                 "PROBE_DATA_RELOCATION_REQUIRED",
@@ -255,6 +286,11 @@ class TorrentDownloadService:
             return snapshot
         if snapshot.is_active or snapshot.state != 0:
             self.client.stop(snapshot.infohash)
+            if not self._wait_for_rtorrent(
+                lambda: self.client.download_state(snapshot.infohash) == 0
+                and not self.client.is_active(snapshot.infohash)
+            ):
+                return self._startup_failure(snapshot, "directory-stop")
             snapshot = self.client.download_snapshot(snapshot.infohash)
             self.latest_snapshot = snapshot
             if snapshot.is_active:
@@ -265,10 +301,28 @@ class TorrentDownloadService:
                     3,
                     {},
                 )
+        if probe_handoff is not None and self.client.is_open(snapshot.infohash):
+            self.client.close_download(snapshot.infohash)
+            if not self._wait_for_rtorrent(lambda: not self.client.is_open(snapshot.infohash)):
+                return self._startup_failure(snapshot, "probe-close")
+        if probe_handoff is not None and base_path is not None:
+            filesystem = self.directories.filesystem
+            if filesystem.exists(base_path):
+                destination = target / base_path.name
+                if filesystem.exists(destination):
+                    raise RuntimeFailure(
+                        "DOWNLOAD_PATH_COLLISION",
+                        "DOWNLOAD_PATH_COLLISION",
+                        "The permanent payload relocation destination already exists.",
+                        5,
+                        {"destination": str(destination)},
+                    )
+                filesystem.rename(base_path, destination)
         self.client.set_download_directory(snapshot.infohash, target)
         updated = self.client.download_snapshot(snapshot.infohash)
         self.latest_snapshot = updated
-        if _safe_remote_path(updated.directory) != target:
+        reported = _safe_remote_path(updated.directory)
+        if not _registered_download_directory(reported, target, updated.name):
             raise RuntimeFailure(
                 "TORRENT_STATE_INVALID",
                 "TORRENT_STATE_INVALID",
@@ -276,7 +330,136 @@ class TorrentDownloadService:
                 3,
                 {"reported_directory": updated.directory, "expected_directory": str(target)},
             )
+        if probe_handoff is not None:
+            self._probe_handoff_cleanup = probe_handoff
         return updated
+
+    def _owned_probe_handoff_paths(
+        self,
+        current: PurePosixPath | None,
+        probe_job_id: str | None,
+        infohash: str,
+    ) -> tuple[PurePosixPath, PurePosixPath] | None:
+        """Resolve an exact Step 5 job/hash path beneath the canonical probe root."""
+        probe_root = self.directories.probe_root
+        if current is None or probe_root is None or not probe_job_id:
+            return None
+        filesystem = self.directories.filesystem
+        try:
+            if not filesystem.exists(probe_root) or not filesystem.exists(current):
+                return None
+            canonical_root = filesystem.canonicalize(probe_root)
+            canonical_current = filesystem.canonicalize(current)
+            relative = canonical_current.relative_to(canonical_root)
+        except (DownloadError, OSError, ValueError):
+            return None
+        if (
+            len(relative.parts) < 2
+            or relative.parts[0] != probe_job_id
+            or relative.parts[1].casefold() != infohash.casefold()
+        ):
+            return None
+        job_directory = canonical_root / relative.parts[0]
+        candidate_directory = job_directory / relative.parts[1]
+        return candidate_directory, job_directory
+
+    def _cleanup_probe_handoff(
+        self,
+        candidate_directory: PurePosixPath,
+        job_directory: PurePosixPath,
+    ) -> None:
+        """Best-effort removal of the exact probe candidate after a safe redirect."""
+        filesystem = self.directories.filesystem
+        try:
+            if filesystem.exists(candidate_directory):
+                info = filesystem.lstat(candidate_directory)
+                if not info.is_directory or info.is_symlink:
+                    raise OSError("probe candidate is not a safe directory")
+                filesystem.remove_tree(candidate_directory)
+            if filesystem.exists(job_directory) and not filesystem.listdir(job_directory):
+                info = filesystem.lstat(job_directory)
+                if not info.is_directory or info.is_symlink:
+                    raise OSError("probe job is not a safe directory")
+                filesystem.remove_tree(job_directory)
+        except (DownloadError, OSError):
+            self.record.warnings.append(
+                "The redirected torrent is safe, but its old probe placeholders could not be "
+                "fully cleaned up."
+            )
+
+    def _start_or_resume(self, snapshot: DownloadSnapshot) -> DownloadSnapshot:
+        """Refresh stale probe file state, start the torrent, and verify activation."""
+        current = snapshot
+        infohash = snapshot.infohash
+        for _cycle in range(RTORRENT_STARTUP_CYCLES):
+            if (
+                self.client.download_state(infohash) != 0
+                or self.client.is_active(infohash)
+            ):
+                self.client.stop(infohash)
+                if not self._wait_for_rtorrent(
+                    lambda: self.client.download_state(infohash) == 0
+                    and not self.client.is_active(infohash)
+                ):
+                    return self._startup_failure(current, "stop")
+            if self.client.is_open(infohash):
+                self.client.close_download(infohash)
+                if not self._wait_for_rtorrent(lambda: not self.client.is_open(infohash)):
+                    return self._startup_failure(current, "close")
+            self.client.open_download(infohash)
+            if not self._wait_for_rtorrent(lambda: self.client.is_open(infohash)):
+                return self._startup_failure(current, "open")
+            self.client.start(infohash)
+            if not self._wait_for_rtorrent(
+                lambda: self.client.download_state(infohash) != 0
+            ):
+                return self._startup_failure(current, "start")
+            for _attempt in range(RTORRENT_ACTIVATION_ATTEMPTS):
+                self.client.resume(infohash)
+                self.sleep(RTORRENT_STARTUP_SETTLE_SECONDS)
+                if self.client.is_active(infohash):
+                    current = self.client.download_snapshot(infohash)
+                    self._validate_identity(current, snapshot.infohash)
+                    if current.is_active or current.hashing or self._is_complete(current):
+                        return current
+
+        current = self.client.download_snapshot(infohash)
+        self._validate_identity(current, snapshot.infohash)
+        if current.hashing or self._is_complete(current):
+            return current
+        self._stop_and_mark(current.infohash, DownloadState.FAILED)
+        raise RuntimeFailure(
+            "TORRENT_STATE_INVALID",
+            "TORRENT_STATE_INVALID",
+            "rTorrent did not activate the selected torrent after bounded start/resume retries.",
+            3,
+            {
+                "rtorrent_state": current.state,
+                "rtorrent_active": current.is_active,
+                "rtorrent_open": current.is_open,
+                "activation_attempts": RTORRENT_ACTIVATION_ATTEMPTS,
+                "startup_cycles": RTORRENT_STARTUP_CYCLES,
+            },
+        )
+
+    def _wait_for_rtorrent(self, predicate: Callable[[], bool]) -> bool:
+        """Poll a short-lived rTorrent state transition with a fixed upper bound."""
+        for _attempt in range(RTORRENT_ACTIVATION_ATTEMPTS):
+            self.sleep(RTORRENT_STARTUP_SETTLE_SECONDS)
+            if predicate():
+                return True
+        return False
+
+    def _startup_failure(self, snapshot: DownloadSnapshot, transition: str) -> DownloadSnapshot:
+        """Stop and report one failed startup transition."""
+        self._stop_and_mark(snapshot.infohash, DownloadState.FAILED)
+        raise RuntimeFailure(
+            "TORRENT_STATE_INVALID",
+            "TORRENT_STATE_INVALID",
+            f"rTorrent did not confirm the '{transition}' startup transition.",
+            3,
+            {"failed_transition": transition},
+        )
 
     def _monitor(
         self,
@@ -413,6 +596,9 @@ class TorrentDownloadService:
             if not final.is_active:
                 self.client.start(infohash)
             final_state = "seeding"
+        if self._probe_handoff_cleanup is not None:
+            self._cleanup_probe_handoff(*self._probe_handoff_cleanup)
+            self._probe_handoff_cleanup = None
         self.client.set_download_state(infohash, DownloadState.READY_FOR_TRANSFER.value)
         self.record.transition(DownloadState.READY_FOR_TRANSFER, self._timestamp())
         elapsed = self.monotonic() - started
@@ -686,6 +872,17 @@ def _path_is_under(path: PurePosixPath, root: PurePosixPath) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _registered_download_directory(
+    reported: PurePosixPath | None,
+    target: PurePosixPath,
+    torrent_name: str,
+) -> bool:
+    """Accept rTorrent's job root or its direct torrent-name child."""
+    if reported == target:
+        return True
+    return reported is not None and reported.parent == target and reported.name == torrent_name
 
 
 def _short_hash(value: str) -> str:

@@ -37,6 +37,8 @@ class FakeRtorrent:
         self.fail_submission_after_add: set[str] = set()
         self.fail_erase: set[str] = set()
         self.inactive: set[str] = set()
+        self.stopping: set[str] = set()
+        self.stop_delay_checks: dict[str, int] = {}
         self.remote_dirs = {"/remote/home", "/remote/home/probes"}
         self.capabilities = RtorrentCapabilities(
             "0.9.8",
@@ -66,7 +68,16 @@ class FakeRtorrent:
         return "load.start_verbose"
 
     def is_active(self, infohash: str) -> bool:
-        return infohash.upper() not in self.inactive
+        target = infohash.upper()
+        self.calls.append(("active", target))
+        if target in self.stopping:
+            remaining = self.stop_delay_checks.get(target, 0)
+            if remaining > 0:
+                self.stop_delay_checks[target] = remaining - 1
+                return True
+            self.stopping.discard(target)
+            self.inactive.add(target)
+        return target not in self.inactive
 
     def call(self, method: str, *params: object) -> object:
         self.calls.append(("rpc", method, *params))
@@ -132,7 +143,9 @@ class FakeRtorrent:
         return value
 
     def stop(self, infohash: str) -> None:
-        self.calls.append(("stop", infohash.upper()))
+        target = infohash.upper()
+        self.calls.append(("stop", target))
+        self.stopping.add(target)
 
     def erase(self, infohash: str) -> None:
         self.calls.append(("erase", infohash.upper()))
@@ -186,6 +199,30 @@ def test_first_candidate_retrieves_metadata_and_is_stopped_retained() -> None:
     assert HASH_A.upper() in client.existing
     assert ("stop", HASH_A.upper()) in client.calls
     assert ("erase", HASH_A.upper()) not in client.calls
+
+
+def test_successful_probe_waits_for_asynchronous_stop_before_handoff() -> None:
+    client = FakeRtorrent({HASH_A: [metadata(True, 3, 1)]})
+    client.stop_delay_checks[HASH_A.upper()] = 2
+
+    payload, code = run_service(make_service(client), candidate(1))
+
+    assert code == 0
+    assert payload["selected_candidate"]["rtorrent_state"] == "stopped"
+    assert sum(call[:2] == ("active", HASH_A.upper()) for call in client.calls) == 3
+    assert HASH_A.upper() in client.inactive
+
+
+def test_probe_stop_timeout_never_hands_candidate_to_downloader() -> None:
+    client = FakeRtorrent({HASH_A: [metadata(True, 3, 1)]})
+    client.stop_delay_checks[HASH_A.upper()] = 100
+
+    payload, code = run_service(make_service(client), candidate(1))
+
+    assert code == 6
+    assert payload["selected_candidate"] is None
+    assert payload["attempts"][0]["status"] == "TORRENT_STOP_TIMEOUT"
+    assert HASH_A.upper() not in client.existing
 
 
 def test_first_times_out_is_cleaned_and_second_succeeds() -> None:

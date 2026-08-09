@@ -191,6 +191,13 @@ desktop:
 media-recommend | python -m media_scope.movie_search | python -m media_scope.movie_probe
 ```
 
+To continue directly into the full-download stage, add the existing downloader to
+the pipeline:
+
+```powershell
+media-recommend | python -m media_scope.movie_search | python -m media_scope.movie_probe | media-download-torrent
+```
+
 The validator processes recommendations in order and each movie's results by rank. It
 uses a direct magnet when available, constructs one from an infohash, or resolves a
 same-origin Jackett download URL. Private or unresolvable results are skipped. At most
@@ -200,10 +207,12 @@ as `READY_FOR_DOWNLOAD`. Failed probes are erased.
 
 The script uses the existing `RTORRENT_RPC_*`, `RTORRENT_PROBE_*`, `JACKETT_*`, and
 `SEEDBOX_SSH_*` settings from `.env`. Probe directories are remote POSIX paths managed
-through SFTP, so no seedbox filesystem mount is required on Windows. JSON is written to
-standard output for the next stage and the exact same JSON is atomically mirrored to
-`TORRENTVALIDATION.txt` in `RECOMMENDATIONS_DIRECTORY`. Add `--pretty` for indented JSON
-or `--verbose` for diagnostics on standard error.
+through SFTP, so no seedbox filesystem mount is required on Windows. JSON is written
+to standard output for the next stage and the exact same JSON is atomically mirrored
+to `TORRENTVALIDATION.txt` in `RECOMMENDATIONS_DIRECTORY` for manual inspection and
+debugging only. The normal pipeline passes JSON directly and does not read the
+mirrored file. Add `--pretty` for indented JSON or `--verbose` for diagnostics on
+standard error.
 
 This MVP validates live metadata retrieval only. It does not inspect the torrent file
 list or validate movie content, codecs, or resolution.
@@ -601,7 +610,8 @@ fails, the result is `NO_HEALTHY_TORRENT_FOUND` and exit code 6.
 
 `media-download-torrent` consumes Step 5's successful JSON result and resumes the
 exact validated rTorrent item through full payload completion from the local Windows
-PC. It never submits the
+PC. It reads that JSON from standard input by default; `--health-result` remains
+available for a deliberate manual retry from a saved result. It never submits the
 magnet again, never selects a fallback candidate, never erases the torrent, and never
 transfers payload files to the local PC. Step 7 will perform the SFTP transfer using
 the verified remote paths returned here.
@@ -613,14 +623,18 @@ The handoff must have `result=candidate_health_validated` and a
 missing item returns `SELECTED_TORRENT_NOT_FOUND` and requires Step 5 to be rerun;
 Step 6 does not silently re-add it.
 
+Before starting an inactive, incomplete item, Step 6 stops it if necessary and uses
+`d.close` followed by `d.open` to refresh file state after the probe-directory change.
+It then calls `d.start` and `d.resume`. Step 6 reads back rTorrent state and does not
+label the item `DOWNLOADING` unless it becomes active, begins hash checking, or is
+already complete. Closing and reopening retains the torrent and partial payload data.
+
 ### Download configuration
 
 Step 6 reuses Step 5's `RTORRENT_RPC_*` settings and adds:
 
 ```dotenv
 RTORRENT_DOWNLOAD_DIRECTORY=/srv/rtorrent/completed-media-downloads
-RTORRENT_DOWNLOAD_POLL_INTERVAL_SECONDS=30
-RTORRENT_STALL_TIMEOUT_SECONDS=1800
 RTORRENT_DOWNLOAD_TIMEOUT_SECONDS=0
 RTORRENT_POST_COMPLETION_POLICY=stop
 RTORRENT_POST_PROCESS_GRACE_SECONDS=30
@@ -638,8 +652,6 @@ SEEDBOX_SSH_KNOWN_HOSTS=C:\\Users\\you\\.ssh\\known_hosts
 - `SEEDBOX_SSH_*` and `SEEDBOX_USERNAME` / `SEEDBOX_PASSWORD` configure encrypted
   SFTP access for all seedbox filesystem operations. The host key must already be in
   `known_hosts`; Step 6 never accepts an unknown or changed key automatically.
-- `RTORRENT_DOWNLOAD_POLL_INTERVAL_SECONDS` defaults to 30 seconds.
-- `RTORRENT_STALL_TIMEOUT_SECONDS` defaults to 1800 seconds without useful progress.
 - `RTORRENT_DOWNLOAD_TIMEOUT_SECONDS=0` disables the overall timeout.
 - `RTORRENT_POST_COMPLETION_POLICY` accepts `stop` or `leave_running`. The CLI spelling
   for the latter is `leave-running`.
@@ -652,6 +664,11 @@ All configured rTorrent directories are absolute POSIX paths on the seedbox. Ste
 runs locally and uses SFTP for remote directory checks, creation, payload-size
 calculation, and FileBot final-path validation. It does not require a mounted seedbox
 filesystem or an SSH shell.
+
+The MVP checks rTorrent for download progress every 15 minutes and treats two hours
+without meaningful progress as stalled. These timings are fixed in the download
+command rather than exposed as deployment configuration. A completed torrent may
+therefore take up to 15 minutes to be reported as complete.
 
 ### Permanent directory and remote-path safety
 
@@ -734,8 +751,7 @@ Validate the Step 5 JSON, live torrent identity and metadata, and prospective re
 paths without starting, stopping, tagging, redirecting, or creating remote directories:
 
 ```powershell
-python -m media_scope.download_torrent `
-  --health-result health-result.json `
+Get-Content -Raw health-result.json | media-download-torrent `
   --dry-run `
   --pretty
 ```
@@ -743,14 +759,17 @@ python -m media_scope.download_torrent `
 Resume and monitor the full download:
 
 ```powershell
-python -m media_scope.download_torrent `
-  --health-result health-result.json `
+Get-Content -Raw health-result.json | media-download-torrent `
   --output download-result.json `
-  --poll-interval-seconds 30 `
-  --stall-timeout-seconds 1800 `
   --download-timeout-seconds 0 `
   --post-completion-policy stop `
   --pretty
+```
+
+For a manual retry, bypass standard input and read the saved result directly:
+
+```powershell
+media-download-torrent --health-result health-result.json --pretty
 ```
 
 Resume a job that Step 6 previously marked stalled:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 import xmlrpc.client
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import httpx
 import pytest
@@ -13,6 +13,7 @@ from media_scope.exceptions import (
     MagnetSubmissionUnsupportedError,
     RtorrentAuthenticationError,
     RtorrentConfigurationError,
+    RtorrentMethodError,
     RtorrentRpcError,
 )
 from media_scope.rtorrent_client import RtorrentClient, sanitize_rpc_endpoint
@@ -51,7 +52,10 @@ DOWNLOAD_REQUIRED = {
     "d.directory.set",
     "d.custom",
     "d.custom.set",
+    "d.open",
+    "d.close",
     "d.start",
+    "d.resume",
     "d.stop",
     "d.state",
     "d.is_active",
@@ -239,7 +243,11 @@ def test_submit_magnet_preserves_posix_directory_path() -> None:
         transport=rpc_transport(captured=captured),
     ) as client:
         client.discover_capabilities()
-        client.submit_magnet(f"magnet:?xt=urn:btih:{'a' * 40}", "a" * 40, directory)
+        client.submit_magnet(
+            f"magnet:?xt=urn:btih:{'a' * 40}",
+            "a" * 40,
+            PurePosixPath(directory),
+        )
     params, _method = xmlrpc.client.loads(captured[-1].content)
     assert params[-1] == f"d.directory.set={directory}"
 
@@ -294,6 +302,9 @@ def test_download_snapshot_and_named_fields_use_no_legacy_custom_slot(tmp_path: 
             source="probe-1",
             tmdb_id=1,
         )
+        client.close_download("a" * 40)
+        client.open_download("a" * 40)
+        client.resume("a" * 40)
     assert capabilities.hash_method == "d.hash"
     assert status.completed_bytes == 40
     assert status.left_bytes == 60
@@ -304,6 +315,9 @@ def test_download_snapshot_and_named_fields_use_no_legacy_custom_slot(tmp_path: 
         "media_download_source",
         "media_download_tmdb_id",
     ]
+    assert ("d.resume", (("a" * 40).upper(),)) in captured
+    assert ("d.close", (("a" * 40).upper(),)) in captured
+    assert ("d.open", (("a" * 40).upper(),)) in captured
     assert not any(method == "d.custom1" for method, _params in captured)
 
 
@@ -314,6 +328,15 @@ def test_download_capabilities_do_not_require_magnet_load_methods() -> None:
         capabilities = client.discover_download_capabilities()
     assert capabilities.hash_method == "d.hash"
     assert not any(name.startswith("load.") for name in capabilities.methods)
+
+
+def test_download_capabilities_require_resume_support() -> None:
+    with RtorrentClient(
+        "http://localhost/RPC",
+        transport=rpc_transport(DOWNLOAD_REQUIRED - {"d.resume"}),
+    ) as client:
+        with pytest.raises(RtorrentMethodError):
+            client.discover_download_capabilities()
 
 
 def test_status_messages_redact_embedded_urls() -> None:

@@ -47,6 +47,11 @@ class FakeDownloadClient:
         self.custom = dict(custom or {})
         self.exists_values = list(exists or [])
         self.calls: list[tuple[Any, ...]] = []
+        self.runtime_state = snapshots[0].state
+        self.runtime_active = snapshots[0].is_active
+        self.runtime_open = snapshots[0].is_open
+        self.resume_delay_checks = 0
+        self.resume_calls = 0
 
     def discover_download_capabilities(self) -> DownloadCapabilities:
         return DownloadCapabilities("0.9.8", "0.13.8", "9", frozenset(), "d.is_meta", "d.hash")
@@ -59,6 +64,9 @@ class FakeDownloadClient:
         self.calls.append(("snapshot", infohash))
         if self.snapshots:
             self.last = self.snapshots.pop(0)
+            self.runtime_state = self.last.state
+            self.runtime_active = self.last.is_active
+            self.runtime_open = self.last.is_open
         return self.last
 
     def get_custom(self, infohash: str, name: str) -> str | None:
@@ -78,9 +86,38 @@ class FakeDownloadClient:
 
     def start(self, infohash: str) -> None:
         self.calls.append(("start", infohash))
+        self.runtime_state = 1
+
+    def open_download(self, infohash: str) -> None:
+        self.calls.append(("open", infohash))
+        self.runtime_open = True
+
+    def close_download(self, infohash: str) -> None:
+        self.calls.append(("close", infohash))
+        self.runtime_open = False
+
+    def resume(self, infohash: str) -> None:
+        self.calls.append(("resume", infohash))
+        self.resume_calls += 1
+        if self.resume_calls > self.resume_delay_checks:
+            self.runtime_active = True
 
     def stop(self, infohash: str) -> None:
         self.calls.append(("stop", infohash))
+        self.runtime_state = 0
+        self.runtime_active = False
+
+    def is_active(self, infohash: str) -> bool:
+        self.calls.append(("is_active", infohash))
+        return self.runtime_active
+
+    def is_open(self, infohash: str) -> bool:
+        self.calls.append(("is_open", infohash))
+        return self.runtime_open
+
+    def download_state(self, infohash: str) -> int:
+        self.calls.append(("download_state", infohash))
+        return self.runtime_state
 
 
 def remote_path(path: Path | PurePosixPath) -> PurePosixPath:
@@ -148,6 +185,7 @@ def make_service(
         tmdb_id=4608,
         title="30 Rock",
         infohash=HASH_A,
+        probe_root="/probes",
         allowed_final_roots=[remote_path(item) for item in allowed or []],
     )
     clock = Clock()
@@ -217,6 +255,116 @@ def test_active_restart_resumes_monitoring_without_duplicate_start(tmp_path: Pat
     assert not any(call[0] == "start" for call in client.calls)
 
 
+def test_paused_torrent_is_stopped_reopened_and_resumed(tmp_path: Path) -> None:
+    target = (tmp_path / "downloads" / "4608-30-rock-aaaaaaaa").resolve()
+    paused = replace(snapshot(target, active=False, rate=0), state=1, is_open=True)
+    client = FakeDownloadClient(
+        [
+            paused,
+            snapshot(target),
+            snapshot(target, completed=100, complete=True, rate=0),
+        ]
+    )
+    service, directories, clock = make_service(tmp_path, client)
+    prepare_payload(directories)
+
+    payload, code = run(service)
+
+    assert code == 0
+    assert payload["ready_for_transfer"] is True
+    operations = [call[0] for call in client.calls]
+    assert operations.index("stop") < operations.index("close")
+    assert operations.index("close") < operations.index("open")
+    assert operations.index("open") < operations.index("start")
+    assert operations.index("start") < operations.index("resume")
+    assert ("resume", HASH_A) in client.calls
+    assert clock.value == 10
+
+
+def test_activation_retries_resume_after_rtorrent_stays_paused(tmp_path: Path) -> None:
+    target = (tmp_path / "downloads" / "4608-30-rock-aaaaaaaa").resolve()
+    paused = replace(snapshot(target, active=False, rate=0), state=1, is_open=True)
+    client = FakeDownloadClient(
+        [
+            paused,
+            snapshot(target),
+            snapshot(target, completed=100, complete=True, rate=0),
+        ]
+    )
+    client.resume_delay_checks = 1
+    service, directories, clock = make_service(tmp_path, client)
+    prepare_payload(directories)
+
+    payload, code = run(service)
+
+    assert code == 0
+    assert payload["ready_for_transfer"] is True
+    assert sum(call[0] == "resume" for call in client.calls) == 2
+    assert clock.value == 12
+
+
+def test_second_full_startup_cycle_recovers_after_first_stays_paused(tmp_path: Path) -> None:
+    target = (tmp_path / "downloads" / "4608-30-rock-aaaaaaaa").resolve()
+    stopped = replace(snapshot(target, active=False, rate=0), is_open=True)
+    client = FakeDownloadClient(
+        [
+            stopped,
+            snapshot(target),
+            snapshot(target, completed=100, complete=True, rate=0),
+        ]
+    )
+    client.resume_delay_checks = 5
+    service, directories, _clock = make_service(tmp_path, client)
+    prepare_payload(directories)
+
+    payload, code = run(service)
+
+    assert code == 0
+    assert payload["ready_for_transfer"] is True
+    assert sum(call[0] == "close" for call in client.calls) == 2
+    assert sum(call[0] == "open" for call in client.calls) == 2
+    assert sum(call[0] == "start" for call in client.calls) == 2
+
+
+def test_stopped_torrent_is_reopened_before_start(tmp_path: Path) -> None:
+    target = (tmp_path / "downloads" / "4608-30-rock-aaaaaaaa").resolve()
+    stopped = replace(snapshot(target, active=False, rate=0), is_open=True)
+    client = FakeDownloadClient(
+        [
+            stopped,
+            snapshot(target),
+            snapshot(target, completed=100, complete=True, rate=0),
+        ]
+    )
+    service, directories, _clock = make_service(tmp_path, client)
+    prepare_payload(directories)
+
+    payload, code = run(service)
+
+    assert code == 0
+    assert payload["ready_for_transfer"] is True
+    assert ("close", HASH_A) in client.calls
+    assert ("open", HASH_A) in client.calls
+    assert ("start", HASH_A) in client.calls
+    assert ("resume", HASH_A) in client.calls
+
+
+def test_failed_resume_never_marks_torrent_downloading(tmp_path: Path) -> None:
+    target = (tmp_path / "downloads" / "4608-30-rock-aaaaaaaa").resolve()
+    paused = replace(snapshot(target, active=False, rate=0), state=1, is_open=True)
+    client = FakeDownloadClient([paused, paused])
+    client.resume_delay_checks = 100
+
+    payload, code = run(make_service(tmp_path, client)[0])
+
+    assert (code, payload["error_code"]) == (3, "TORRENT_STATE_INVALID")
+    assert ("resume", HASH_A) in client.calls
+    assert ("stop", HASH_A) in client.calls
+    states = [call[2] for call in client.calls if call[0] == "custom_state"]
+    assert states[-1] == "FAILED"
+    assert "DOWNLOADING" not in states
+
+
 def test_missing_torrent_and_metadata_only_are_identity_failures(tmp_path: Path) -> None:
     target = (tmp_path / "downloads" / "4608-30-rock-aaaaaaaa").resolve()
     missing = FakeDownloadClient([snapshot(target)], exists=[False])
@@ -243,6 +391,65 @@ def test_partial_probe_payload_requires_safe_relocation(tmp_path: Path) -> None:
     assert not any(call[0] == "directory" for call in client.calls)
 
 
+def test_owned_partial_probe_payload_is_relocated_and_cleaned(tmp_path: Path) -> None:
+    probe_job = PurePosixPath("/probes/probe-example")
+    probe_candidate = probe_job / HASH_A
+    reported = probe_candidate / "Example Complete"
+    target = (tmp_path / "downloads" / "4608-30-rock-aaaaaaaa").resolve()
+    client = FakeDownloadClient(
+        [
+            snapshot(reported, completed=4_718_592, active=False, rate=0, base_path=reported),
+            snapshot(target, active=False, rate=0),
+            snapshot(target, completed=100, complete=True, rate=0, base_path=target),
+        ]
+    )
+    service, directories, _clock = make_service(tmp_path, client)
+    directories.filesystem.add_file(reported / "movie.mkv", size=1_625_000_000)  # type: ignore[attr-defined]
+    directories.filesystem.add_file(probe_candidate / f"{HASH_A.upper()}.meta", size=62_000)  # type: ignore[attr-defined]
+
+    payload, code = run(service)
+
+    assert code == 0
+    assert payload["ready_for_transfer"] is True
+    assert any(call[0] == "rename" for call in directories.filesystem.calls)
+    assert not directories.filesystem.exists(probe_candidate)
+    assert not directories.filesystem.exists(probe_job)
+
+
+def test_probe_metadata_is_retained_until_download_activation_succeeds(tmp_path: Path) -> None:
+    probe_job = PurePosixPath("/probes/probe-example")
+    probe_candidate = probe_job / HASH_A
+    reported = probe_candidate / "Example Complete"
+    target = (tmp_path / "downloads" / "4608-30-rock-aaaaaaaa").resolve()
+    inactive = snapshot(target, active=False, rate=0)
+    client = FakeDownloadClient(
+        [snapshot(reported, active=False, rate=0, base_path=reported), inactive]
+    )
+    client.resume_delay_checks = 100
+    service, directories, _clock = make_service(tmp_path, client)
+    directories.filesystem.add_file(reported / "movie.mkv", size=1_625_000_000)  # type: ignore[attr-defined]
+    directories.filesystem.add_file(probe_candidate / f"{HASH_A.upper()}.meta", size=62_000)  # type: ignore[attr-defined]
+
+    payload, code = run(service)
+
+    assert (code, payload["error_code"]) == (3, "TORRENT_STATE_INVALID")
+    assert directories.filesystem.exists(probe_candidate / f"{HASH_A.upper()}.meta")
+
+
+def test_zero_completed_unowned_files_are_still_preserved(tmp_path: Path) -> None:
+    outside = PurePosixPath("/outside/unowned")
+    client = FakeDownloadClient(
+        [snapshot(outside, active=False, rate=0, base_path=outside)]
+    )
+    service, directories, _clock = make_service(tmp_path, client)
+    directories.filesystem.add_file(outside / "movie.mkv", size=100)  # type: ignore[attr-defined]
+
+    payload, code = run(service)
+
+    assert (code, payload["error_code"]) == (5, "PROBE_DATA_RELOCATION_REQUIRED")
+    assert directories.filesystem.exists(outside / "movie.mkv")
+
+
 def test_empty_probe_directory_is_redirected_and_confirmed_before_start(tmp_path: Path) -> None:
     probe = (tmp_path / "probes" / "probe-job" / HASH_A).resolve()
     target = (tmp_path / "downloads" / "4608-30-rock-aaaaaaaa").resolve()
@@ -264,6 +471,62 @@ def test_empty_probe_directory_is_redirected_and_confirmed_before_start(tmp_path
     assert (
         payload["paths"]["base_path_before_download"] == "/downloads/4608-30-rock-aaaaaaaa/payload"
     )
+
+
+def test_rtorrent_torrent_name_child_is_accepted_after_directory_change(tmp_path: Path) -> None:
+    probe = (tmp_path / "probes" / "probe-job" / HASH_A).resolve()
+    target = (tmp_path / "downloads" / "4608-30-rock-aaaaaaaa").resolve()
+    reported = target / "Example Complete"
+    client = FakeDownloadClient(
+        [
+            snapshot(probe, active=False, rate=0),
+            snapshot(reported, active=False, rate=0, base_path=probe / "Example Complete"),
+            snapshot(reported, completed=100, complete=True, rate=0, base_path=target),
+        ]
+    )
+    service, _directories, _clock = make_service(tmp_path, client)
+
+    payload, code = run(service)
+
+    assert code == 0
+    assert payload["status"] == "READY_FOR_TRANSFER"
+    assert ("start", HASH_A) in client.calls
+
+
+def test_unexpected_child_is_rejected_after_directory_change(tmp_path: Path) -> None:
+    probe = (tmp_path / "probes" / "probe-job" / HASH_A).resolve()
+    target = (tmp_path / "downloads" / "4608-30-rock-aaaaaaaa").resolve()
+    client = FakeDownloadClient(
+        [
+            snapshot(probe, active=False, rate=0),
+            snapshot(target / "Different Name", active=False, rate=0),
+        ]
+    )
+    service, _directories, _clock = make_service(tmp_path, client)
+
+    payload, code = run(service)
+
+    assert (code, payload["error_code"]) == (3, "TORRENT_STATE_INVALID")
+    assert not any(call[0] == "start" for call in client.calls)
+
+
+def test_matching_child_proves_ownership_on_retry(tmp_path: Path) -> None:
+    target = (tmp_path / "downloads" / "4608-30-rock-aaaaaaaa").resolve()
+    reported = target / "Example Complete"
+    client = FakeDownloadClient(
+        [
+            snapshot(reported, active=False, rate=0),
+            snapshot(reported, completed=100, complete=True, rate=0, base_path=target),
+        ]
+    )
+    service, directories, _clock = make_service(tmp_path, client)
+    directories.filesystem.add_directory(remote_path(target))  # type: ignore[attr-defined]
+
+    payload, code = run(service)
+
+    assert code == 0
+    assert payload["status"] == "READY_FOR_TRANSFER"
+    assert not any(call[0] == "directory" for call in client.calls)
 
 
 @pytest.mark.parametrize(
@@ -317,7 +580,10 @@ def test_hash_check_failure_has_distinct_error(tmp_path: Path) -> None:
 
 def test_torrent_disappearance_during_monitoring_is_reported(tmp_path: Path) -> None:
     target = (tmp_path / "downloads" / "4608-30-rock-aaaaaaaa").resolve()
-    client = FakeDownloadClient([snapshot(target, active=False, rate=0)], exists=[True, False])
+    client = FakeDownloadClient(
+        [snapshot(target, active=False, rate=0), snapshot(target)],
+        exists=[True, False],
+    )
     payload, code = run(make_service(tmp_path, client)[0])
     assert (code, payload["error_code"]) == (3, "TORRENT_DISAPPEARED")
 

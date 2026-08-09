@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import xmlrpc.client
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -56,7 +56,10 @@ _KNOWN_METHODS = frozenset(
         "d.directory.set",
         "d.custom",
         "d.custom.set",
+        "d.open",
+        "d.close",
         "d.start",
+        "d.resume",
         "d.stop",
         "d.erase",
         "execute.capture",
@@ -206,12 +209,18 @@ class RtorrentClient:
             "d.name",
             "d.size_bytes",
             "d.completed_bytes",
+            "d.state",
+            "d.is_active",
+            "d.is_open",
             "d.directory",
             "d.base_path",
             "d.directory.set",
             "d.custom",
             "d.custom.set",
+            "d.open",
+            "d.close",
             "d.start",
+            "d.resume",
             "d.stop",
         }
         missing = required - methods
@@ -248,13 +257,18 @@ class RtorrentClient:
             return False
         return True
 
-    def submit_magnet(self, magnet_uri: str, infohash: str, directory: str) -> str:
+    def submit_magnet(
+        self,
+        magnet_uri: str,
+        infohash: str,
+        directory: str | PurePosixPath,
+    ) -> str:
         """Load and start a magnet using the discovered compatible method."""
         capabilities = self._require_capabilities()
         method = capabilities.load_method
         if method is None:
             raise MagnetSubmissionUnsupportedError("No compatible magnet load method was selected.")
-        directory_value = directory
+        directory_value = str(directory)
         if any(value in directory_value for value in ("\n", "\r", ",")):
             raise RtorrentConfigurationError("Probe directory contains an unsafe character.")
         self.call(method, "", magnet_uri, f"d.directory.set={directory_value}")
@@ -265,6 +279,14 @@ class RtorrentClient:
     def is_active(self, infohash: str) -> bool:
         """Return whether rTorrent is actively running this torrent."""
         return _integer(self.call("d.is_active", infohash.upper())) != 0
+
+    def is_open(self, infohash: str) -> bool:
+        """Return whether rTorrent currently has the torrent open."""
+        return _integer(self.call("d.is_open", infohash.upper())) != 0
+
+    def download_state(self, infohash: str) -> int:
+        """Return rTorrent's stopped/started state for one torrent."""
+        return _integer(self.call("d.state", infohash.upper()))
 
     def tag_probe(self, infohash: str, *, job_id: str, state: str, rank: int | str) -> None:
         """Apply named ownership fields to a newly created probe torrent."""
@@ -383,8 +405,20 @@ class RtorrentClient:
         return text or None
 
     def start(self, infohash: str) -> None:
-        """Start or resume one existing torrent."""
+        """Move one stopped torrent into rTorrent's started state."""
         self.call("d.start", infohash.upper())
+
+    def open_download(self, infohash: str) -> None:
+        """Open one retained torrent's files after a directory change."""
+        self.call("d.open", infohash.upper())
+
+    def close_download(self, infohash: str) -> None:
+        """Close one retained torrent's files without erasing it."""
+        self.call("d.close", infohash.upper())
+
+    def resume(self, infohash: str) -> None:
+        """Clear rTorrent's paused state on one started torrent."""
+        self.call("d.resume", infohash.upper())
 
     def stop(self, infohash: str) -> None:
         """Stop one torrent."""
