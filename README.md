@@ -16,9 +16,12 @@ workflow components:
   ranked, title-matched movie results from configured Jackett indexers.
 - `media-probe-movies` consumes the movie results and selects the first torrent whose
   metadata the remote rTorrent seedbox can retrieve.
+- `media-download-torrent` resumes that retained torrent through verified completion.
+- `media-transfer-movie` downloads the completed payload into the local movies folder,
+  then removes the torrent and its payload from the seedbox.
 
 Its scope is intentionally narrow. It does not scrape websites, inspect torrent file
-lists, transfer files, or run a continuous folder-monitoring service. The Jackett
+lists, or run a continuous folder-monitoring service. The Jackett
 component classifies only release titles and Torznab metadata; it does not approve a
 result or decide whether a work is legally distributable. It may retrieve a small
 `.torrent` metainfo response from Jackett solely to calculate its BitTorrent v1
@@ -196,6 +199,12 @@ the pipeline:
 
 ```powershell
 media-recommend | python -m media_scope.movie_search | python -m media_scope.movie_probe | media-download-torrent
+```
+
+To transfer the completed movie locally and clean it from the seedbox, append Step 7:
+
+```powershell
+media-recommend | python -m media_scope.movie_search | python -m media_scope.movie_probe | media-download-torrent | media-transfer-movie
 ```
 
 The validator processes recommendations in order and each movie's results by rank. It
@@ -840,6 +849,36 @@ are never serialized. The report contains only the sanitized RPC endpoint.
   grace period. Increase `RTORRENT_POST_PROCESS_GRACE_SECONDS` if post-processing is
   predictably slower.
 
+## Local movie transfer and seedbox cleanup (Step 7)
+
+`media-transfer-movie` consumes Step 6's successful JSON result from standard input,
+downloads every reported top-level payload path directly into `MOVIES_DIRECTORY`,
+and only then removes the retained torrent and its remote payload. It accepts movie
+handoffs only. There is no staging directory, overwrite, merge, checksum pass, or
+automatic retry in this MVP.
+
+Run it as part of the pipeline above, from a saved Step 6 result, or as a module:
+
+```powershell
+Get-Content -Raw download-result.json | media-transfer-movie --pretty
+media-transfer-movie --download-result download-result.json --output transfer-result.json
+python -m media_scope.movie_transfer --download-result download-result.json
+```
+
+Before transferring, Step 7 confirms the torrent still belongs to the same Step 6
+job, remains complete and `READY_FOR_TRANSFER`, and exposes only canonical paths under
+`RTORRENT_DOWNLOAD_DIRECTORY` or `RTORRENT_ALLOWED_FINAL_ROOTS`. It rejects symlinks,
+unsafe paths, and any local top-level name already present in `MOVIES_DIRECTORY`
+without changing the seedbox.
+
+After every SFTP download succeeds, the command stops, closes, and erases the torrent,
+confirms its removal, deletes the exact transferred remote paths, and removes the
+deterministic download directory when it is empty. A transfer failure leaves the
+torrent and all remote payload files intact. Partial local files may remain and must
+be removed manually before retrying. A cleanup failure returns
+`transfer_completed_cleanup_failed` and lists the remaining remote paths for manual
+attention.
+
 ## Eligibility and scope rules
 
 - A movie is eligible only when TMDb reports its status as `Released`.
@@ -915,6 +954,18 @@ For `media-download-torrent`:
 | 6 | Download stalled |
 | 7 | Overall download timeout |
 | 8 | Post-processing or final-path validation failure |
+| 9 | Unexpected internal or output-file failure |
+
+For `media-transfer-movie`:
+
+| Code | Meaning |
+| ---: | --- |
+| 0 | Movie transferred locally and seedbox cleanup completed |
+| 2 | Invalid command line, configuration, or Step 6 JSON |
+| 3 | Torrent missing, mismatched, incomplete, or no longer ready for transfer |
+| 4 | rTorrent or SFTP authentication, RPC, host-key, or connection failure |
+| 5 | Unsafe path, local collision, or transfer/storage failure |
+| 7 | Local transfer completed but seedbox cleanup requires manual attention |
 | 9 | Unexpected internal or output-file failure |
 
 Every result or error is JSON on standard output. Logging is restricted to standard

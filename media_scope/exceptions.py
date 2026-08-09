@@ -241,3 +241,38 @@ class SeedboxFilesystemError(DownloadError):
 
     error_code = "SFTP_UNAVAILABLE"
     exit_code = 4
+
+
+class TransferError(MediaScopeError):
+    """Base class for expected Step 7 transfer and cleanup failures."""
+
+    error_code = "TRANSFER_FAILED"
+    exit_code = 9
+
+
+class TransferInputError(TransferError):
+    """Raised when a Step 6 transfer handoff is malformed or unsupported."""
+
+    error_code = "INVALID_DOWNLOAD_RESULT"
+    exit_code = 2
+
+
+class TransferTorrentError(TransferError):
+    """Raised when the retained torrent no longer matches the Step 6 handoff."""
+
+    error_code = "TORRENT_NOT_READY_FOR_TRANSFER"
+    exit_code = 3
+
+
+class TransferStorageError(TransferError):
+    """Raised for unsafe paths, collisions, and local transfer failures."""
+
+    error_code = "TRANSFER_STORAGE_ERROR"
+    exit_code = 5
+
+
+class TransferCleanupError(TransferError):
+    """Raised after transfer when seedbox cleanup cannot be completed."""
+
+    error_code = "SEEDBOX_CLEANUP_FAILED"
+    exit_code = 7

@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "result": "download_completed",
+  "job_id": "download-10331-11ea02584fa6",
+  "scope": {
+    "media_type": "movie",
+    "tmdb_id": 10331,
+    "title": "Night of the Living Dead",
+    "year": 1968,
+    "recommendation_rank": 1
+  },
+  "candidate": {
+    "original_rank": 1,
+    "infohash": "11ea02584fa6351956f35671962ab46354d99060",
+    "release_title": "Night of the Living Dead (1968) 1080p BRRip x264 -YTS",
+    "magnet_uri": "magnet:?xt=urn:btih:11ea02584fa6351956f35671962ab46354d99060&dn=Night%20of%20the%20Living%20Dead%20%281968%29%201080p%20BRRip%20x264%20-YTS&tr=udp:%2F%2Ftracker.opentrackr.org:1337%2Fannounce&tr=udp:%2F%2Fopen.demonii.com:1337%2Fannounce&tr=udp:%2F%2Fopen.stealth.si:80%2Fannounce&tr=udp:%2F%2Ftracker.torrent.eu.org:451%2Fannounce&tr=udp:%2F%2Fvito-tracker.space:6969%2Fannounce&tr=udp:%2F%2Fvito-tracker.duckdns.org:6969%2Fannounce&tr=udp:%2F%2Ftracker.theoks.net:6969%2Fannounce&tr=udp:%2F%2Ftracker.srv00.com:6969%2Fannounce&tr=udp:%2F%2Ftracker.qu.ax:6969%2Fannounce&tr=udp:%2F%2Ftracker.corpscorp.online:80%2Fannounce"
+  },
+  "policy": {
+    "poll_interval_seconds": 900,
+    "stall_timeout_seconds": 7200,
+    "overall_timeout_seconds": 0.0,
+    "post_completion_policy": "stop",
+    "post_processing_grace_seconds": 30.0
+  },
+  "storage": {
+    "protocol": "sftp",
+    "download_directory": "/home21/seedboxer1/downloads/rtorrent/media-downloads/10331-night-of-the-living-dead-11ea0258"
+  },
+  "download": {
+    "status": "DOWNLOAD_COMPLETED",
+    "elapsed_seconds": 44.266,
+    "progress_percent": 100.0,
+    "completed_bytes": 1625731099,
+    "remaining_bytes": 0,
+    "download_rate_bytes_per_second": 0,
+    "uploaded_bytes": 0,
+    "connected_peers": 0,
+    "complete_peers": 0,
+    "maximum_connected_peers": 0,
+    "maximum_complete_peers": 0,
+    "average_download_rate_bytes_per_second": 0,
+    "estimated_remaining_seconds": null,
+    "poll_count": 0,
+    "last_progress_at": null
+  },
+  "paths": {
+    "download_root": "/home21/seedboxer1/downloads/rtorrent/media-downloads",
+    "base_path_before_download": "/home21/seedboxer1/downloads/rtorrent/media-downloads/10331-night-of-the-living-dead-11ea0258/Night Of The Living Dead (1968) [BluRay] [1080p] [YTS.AM]",
+    "rtorrent_base_path": "/home21/seedboxer1/downloads/rtorrent/media-downloads/10331-night-of-the-living-dead-11ea0258/Night Of The Living Dead (1968) [BluRay] [1080p] [YTS.AM]",
+    "final_base_path": "/home21/seedboxer1/downloads/rtorrent/media-downloads/10331-night-of-the-living-dead-11ea0258/Night Of The Living Dead (1968) [BluRay] [1080p] [YTS.AM]",
+    "top_level_paths": [
+      "/home21/seedboxer1/downloads/rtorrent/media-downloads/10331-night-of-the-living-dead-11ea0258/Night Of The Living Dead (1968) [BluRay] [1080p] [YTS.AM]"
+    ],
+    "payload_size_bytes": 1625731099,
+    "path_changed_after_completion": false
+  },
+  "rtorrent": {
+    "rpc_endpoint": "https://seedboxer1.vega.usbx.me/RPC2",
+    "client_version": "0.9.6",
+    "final_state": "stopped",
+    "torrent_retained": true
+  },
+  "state_transitions": [
+    {
+      "state": "PENDING",
+      "at": "2026-08-09T13:52:01.298492Z"
+    },
+    {
+      "state": "VALIDATING_INPUT",
+      "at": "2026-08-09T13:52:01.298492Z"
+    },
+    {
+      "state": "LOCATING_TORRENT",
+      "at": "2026-08-09T13:52:02.314028Z"
+    },
+    {
+      "state": "PREPARING_DIRECTORY",
+      "at": "2026-08-09T13:52:05.799401Z"
+    },
+    {
+      "state": "COMPLETED",
+      "at": "2026-08-09T13:52:09.727944Z"
+    },
+    {
+      "state": "POST_PROCESSING_GRACE",
+      "at": "2026-08-09T13:52:09.853290Z"
+    },
+    {
+      "state": "READY_FOR_TRANSFER",
+      "at": "2026-08-09T13:52:45.567443Z"
+    }
+  ],
+  "status": "READY_FOR_TRANSFER",
+  "ready_for_transfer": true,
+  "warnings": []
+}
