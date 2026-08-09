@@ -76,6 +76,29 @@ class FakeRemoteFilesystem:
             return info.size_bytes
         return sum(self.tree_size(item.path) for item in self.listdir(path) if not item.is_symlink)
 
+    def rename(self, source: PurePosixPath, destination: PurePosixPath) -> None:
+        self.calls.append(("rename", f"{source} -> {destination}"))
+        if destination in self.entries:
+            raise OSError("destination exists")
+        info = self.lstat(source)
+        moving = sorted(
+            [path for path in self.entries if path == source or source in path.parents],
+            key=lambda path: len(path.parts),
+        )
+        for old_path in moving:
+            old = self.entries.pop(old_path)
+            relative = old_path.relative_to(source)
+            new_path = destination / relative if relative.parts else destination
+            self.entries[new_path] = RemotePathInfo(
+                new_path,
+                old.is_directory,
+                old.is_file,
+                old.is_symlink,
+                old.size_bytes,
+            )
+        if not info.is_directory and source in self.entries:
+            raise AssertionError("source relocation failed")
+
     def remove_tree(self, path: PurePosixPath) -> None:
         self.calls.append(("remove_tree", str(path)))
         info = self.lstat(path)

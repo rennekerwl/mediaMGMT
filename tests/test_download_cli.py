@@ -57,12 +57,18 @@ def filesystem_factory(filesystem: FakeRemoteFilesystem) -> Any:
     return factory
 
 
-def test_missing_health_result_is_json_exit_two(capsys: Any) -> None:
-    code = main([])
+def test_empty_stdin_is_json_exit_two(capsys: Any) -> None:
+    code = main([], input_text="")
     captured = capsys.readouterr()
     assert code == 2
-    assert json.loads(captured.out)["error_code"] == "INVALID_CLI_INPUT"
+    assert json.loads(captured.out)["error_code"] == "INVALID_HEALTH_RESULT"
     assert captured.err == ""
+
+
+def test_malformed_stdin_is_exit_two(capsys: Any) -> None:
+    code = main([], input_text="{")
+    assert code == 2
+    assert json.loads(capsys.readouterr().out)["error_code"] == "INVALID_HEALTH_RESULT"
 
 
 def test_malformed_health_result_is_exit_two(tmp_path: Path, capsys: Any) -> None:
@@ -127,9 +133,69 @@ def test_success_stdout_matches_output_and_logs_only_to_stderr(
     parsed = json.loads(captured.out)
     assert code == 0
     assert parsed["status"] == "READY_FOR_TRANSFER"
+    assert parsed["policy"]["poll_interval_seconds"] == 900
+    assert parsed["policy"]["stall_timeout_seconds"] == 7200
     assert output.read_text(encoding="utf-8") == captured.out
     assert "Starting download job" in captured.err
     assert captured.out.lstrip().startswith("{")
+
+
+def test_stdin_handoff_downloads_without_health_result_file(
+    tmp_path: Path, capsys: Any, monkeypatch: Any
+) -> None:
+    root = tmp_path / "downloads"
+    configure(monkeypatch, root)
+    target = (root / "1091-the-thing-aaaaaaaa").resolve()
+    client = CliFakeDownloadClient(
+        "http://rtorrent.test/RPC",
+        snapshots=[snapshot(target, completed=100, complete=True, rate=0)],
+    )
+    filesystem = FakeRemoteFilesystem()
+    filesystem.add_file("/downloads/1091-the-thing-aaaaaaaa/payload/movie.mkv", size=4)
+    movie_health = health_result()
+    movie_health["scope"] = {
+        "media_type": "movie",
+        "tmdb_id": 1091,
+        "title": "The Thing",
+        "year": 1982,
+        "recommendation_rank": 1,
+    }
+
+    code = main(
+        [],
+        input_text=json.dumps(movie_health),
+        client_factory=factory_for(client),
+        filesystem_factory=filesystem_factory(filesystem),
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert payload["status"] == "READY_FOR_TRANSFER"
+    assert payload["scope"]["media_type"] == "movie"
+
+
+def test_health_result_file_takes_precedence_over_stdin(
+    tmp_path: Path, capsys: Any, monkeypatch: Any
+) -> None:
+    root = tmp_path / "downloads"
+    configure(monkeypatch, root)
+    target = (root / "4608-30-rock-aaaaaaaa").resolve()
+    client = CliFakeDownloadClient(
+        "http://rtorrent.test/RPC",
+        snapshots=[snapshot(target, completed=100, complete=True, rate=0)],
+    )
+    filesystem = FakeRemoteFilesystem()
+    filesystem.add_file("/downloads/4608-30-rock-aaaaaaaa/payload/movie.mkv", size=4)
+
+    code = main(
+        ["--health-result", str(write_health(tmp_path / "health.json"))],
+        input_text="not valid JSON",
+        client_factory=factory_for(client),
+        filesystem_factory=filesystem_factory(filesystem),
+    )
+
+    assert code == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "READY_FOR_TRANSFER"
 
 
 def test_missing_torrent_uses_exit_three(tmp_path: Path, capsys: Any, monkeypatch: Any) -> None:
@@ -169,6 +235,8 @@ def test_stalled_download_is_valid_json_exit_six(
     root = tmp_path / "downloads"
     configure(monkeypatch, root)
     target = (root / "4608-30-rock-aaaaaaaa").resolve()
+    monkeypatch.setattr("media_scope.download_cli.DOWNLOAD_POLL_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr("media_scope.download_cli.DOWNLOAD_STALL_TIMEOUT_SECONDS", 0.01)
     client = CliFakeDownloadClient(
         "http://rtorrent.test/RPC",
         snapshots=[
@@ -178,14 +246,7 @@ def test_stalled_download_is_valid_json_exit_six(
         ],
     )
     code = main(
-        [
-            "--health-result",
-            str(write_health(tmp_path / "health.json")),
-            "--poll-interval-seconds",
-            "1",
-            "--stall-timeout-seconds",
-            "1",
-        ],
+        ["--health-result", str(write_health(tmp_path / "health.json"))],
         client_factory=factory_for(client),
         filesystem_factory=filesystem_factory(FakeRemoteFilesystem()),
     )

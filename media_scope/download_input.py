@@ -18,6 +18,13 @@ def load_download_input(path: Path) -> HealthDownloadInput:
         raw = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise DownloadInputError("Health-result input is not readable UTF-8 JSON.") from exc
+    return load_download_input_text(raw)
+
+
+def load_download_input_text(raw: str) -> HealthDownloadInput:
+    """Load one Step 5 result from piped JSON text."""
+    if not raw.strip():
+        raise DownloadInputError("Health-result input was empty.")
     try:
         value = json.loads(raw)
     except json.JSONDecodeError as exc:

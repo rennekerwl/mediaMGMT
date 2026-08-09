@@ -41,6 +41,8 @@ class RemoteFilesystem(Protocol):
 
     def tree_size(self, path: PurePosixPath) -> int: ...
 
+    def rename(self, source: PurePosixPath, destination: PurePosixPath) -> None: ...
+
     def remove_tree(self, path: PurePosixPath) -> None: ...
 
 
@@ -165,6 +167,15 @@ class SftpRemoteFilesystem:
             return 0
         return sum(
             0 if child.is_symlink else self.tree_size(child.path) for child in self.listdir(path)
+        )
+
+    def rename(self, source: PurePosixPath, destination: PurePosixPath) -> None:
+        """Atomically move one exact remote path without overwriting a destination."""
+        if self.exists(destination):
+            self._storage_error("The remote relocation destination already exists.")
+        self._call(
+            lambda sftp: sftp.rename(str(source), str(destination)),
+            retry=False,
         )
 
     def remove_tree(self, path: PurePosixPath) -> None:

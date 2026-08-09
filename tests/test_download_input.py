@@ -8,7 +8,11 @@ from typing import Any
 
 import pytest
 
-from media_scope.download_input import load_download_input, parse_download_input
+from media_scope.download_input import (
+    load_download_input,
+    load_download_input_text,
+    parse_download_input,
+)
 from media_scope.exceptions import DownloadInputError
 
 HASH_A = "a" * 40
@@ -43,6 +47,12 @@ def test_valid_health_result_normalizes_hashes(tmp_path: Path) -> None:
     assert parsed.probe_job_id == "probe-example"
 
 
+def test_valid_health_result_text_uses_the_same_parser() -> None:
+    parsed = load_download_input_text(json.dumps(health_result()))
+    assert parsed.candidate.infohash == HASH_A
+    assert parsed.probe_job_id == "probe-example"
+
+
 @pytest.mark.parametrize(
     ("value", "code"),
     [
@@ -71,3 +81,9 @@ def test_invalid_json_is_structured_input_error(tmp_path: Path) -> None:
     path.write_text("{", encoding="utf-8")
     with pytest.raises(DownloadInputError):
         load_download_input(path)
+
+
+@pytest.mark.parametrize("text", ["", "   ", "{"])
+def test_empty_or_invalid_text_is_structured_input_error(text: str) -> None:
+    with pytest.raises(DownloadInputError):
+        load_download_input_text(text)

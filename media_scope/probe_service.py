@@ -31,6 +31,8 @@ LOGGER = logging.getLogger("media_scope.probe")
 Monotonic = Callable[[], float]
 Sleeper = Callable[[float], None]
 WallClock = Callable[[], datetime]
+RTORRENT_STOP_CONFIRMATION_TIMEOUT_SECONDS = 15
+RTORRENT_STOP_POLL_INTERVAL_SECONDS = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,6 +210,13 @@ class TorrentProbeService:
                 record.transition(ProbeState.METADATA_RETRIEVED, self._timestamp())
                 if created:
                     self.client.stop(candidate.infohash)
+                    if not self._confirm_stopped(candidate.infohash):
+                        record.warnings.append(
+                            "rTorrent remained active after the probe requested a stop."
+                        )
+                        record.transition(ProbeState.RPC_FAILED, self._timestamp())
+                        record.status = "TORRENT_STOP_TIMEOUT"
+                        return self._finish_failure(record, started, created, directory)
                     self.client.set_probe_state(
                         candidate.infohash,
                         "validated_waiting_for_download",
@@ -340,6 +349,19 @@ class TorrentProbeService:
                 return True
             self.sleep(min(0.25, deadline - self.monotonic()))
         return False
+
+    def _confirm_stopped(self, infohash: str) -> bool:
+        """Wait for rTorrent's asynchronous stop to finish before handing off."""
+        deadline = self.monotonic() + RTORRENT_STOP_CONFIRMATION_TIMEOUT_SECONDS
+        while True:
+            if not self.client.torrent_exists(infohash):
+                return False
+            if not self.client.is_active(infohash):
+                return True
+            now = self.monotonic()
+            if now >= deadline:
+                return False
+            self.sleep(min(RTORRENT_STOP_POLL_INTERVAL_SECONDS, deadline - now))
 
     def _finish_failure(
         self,

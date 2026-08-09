@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 
 from media_scope.cli import JsonArgumentParser
 from media_scope.download_directories import DownloadDirectoryManager
-from media_scope.download_input import load_download_input
+from media_scope.download_input import load_download_input, load_download_input_text
 from media_scope.download_service import (
     DownloadPolicy,
     TorrentDownloadService,
@@ -36,6 +36,8 @@ from media_scope.serialization import configure_utf8_stdio, serialize_json
 LOGGER = logging.getLogger("media_scope.download")
 ClientFactory = Callable[..., RtorrentClient]
 FilesystemFactory = Callable[..., SftpRemoteFilesystem]
+DOWNLOAD_POLL_INTERVAL_SECONDS = 15 * 60
+DOWNLOAD_STALL_TIMEOUT_SECONDS = 2 * 60 * 60
 
 
 def build_download_parser() -> argparse.ArgumentParser:
@@ -44,12 +46,14 @@ def build_download_parser() -> argparse.ArgumentParser:
         prog="media-download-torrent",
         description="Resume and monitor the Step 5-selected torrent to verified completion.",
     )
-    parser.add_argument("--health-result", type=Path, help="Step 5 health-result JSON path.")
+    parser.add_argument(
+        "--health-result",
+        type=Path,
+        help="Read Step 5 JSON from this path instead of standard input.",
+    )
     parser.add_argument("--output", type=Path, help="Also write the resulting JSON here.")
     parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON.")
     parser.add_argument("--verbose", action="store_true", help="Log diagnostics to stderr.")
-    parser.add_argument("--poll-interval-seconds", type=_positive_int)
-    parser.add_argument("--stall-timeout-seconds", type=_positive_int)
     parser.add_argument("--download-timeout-seconds", type=_nonnegative_int)
     parser.add_argument(
         "--post-completion-policy",
@@ -67,6 +71,7 @@ def build_download_parser() -> argparse.ArgumentParser:
 def main(
     argv: Sequence[str] | None = None,
     *,
+    input_text: str | None = None,
     client_factory: ClientFactory | None = None,
     filesystem_factory: FilesystemFactory | None = None,
     transport: httpx.BaseTransport | None = None,
@@ -76,8 +81,6 @@ def main(
     parser = build_download_parser()
     try:
         args = parser.parse_args(argv)
-        if args.health_result is None:
-            raise CliInputError("--health-result is required")
     except CliInputError as exc:
         return _emit(_error_payload(exc.error_code, str(exc)), 2, pretty=False)
 
@@ -94,13 +97,17 @@ def main(
     exit_code = 9
     job_id: str | None = None
     try:
-        health = load_download_input(args.health_result)
+        health = (
+            load_download_input(args.health_result)
+            if args.health_result is not None
+            else load_download_input_text(
+                input_text if input_text is not None else sys.stdin.read()
+            )
+        )
         job_id = make_download_job_id(health)
         policy = DownloadPolicy(
-            poll_interval_seconds=args.poll_interval_seconds
-            or _environment_positive_number("RTORRENT_DOWNLOAD_POLL_INTERVAL_SECONDS", 30),
-            stall_timeout_seconds=args.stall_timeout_seconds
-            or _environment_positive_number("RTORRENT_STALL_TIMEOUT_SECONDS", 1800),
+            poll_interval_seconds=DOWNLOAD_POLL_INTERVAL_SECONDS,
+            stall_timeout_seconds=DOWNLOAD_STALL_TIMEOUT_SECONDS,
             overall_timeout_seconds=(
                 args.download_timeout_seconds
                 if args.download_timeout_seconds is not None
@@ -315,13 +322,6 @@ def _environment_bool(name: str, default: bool) -> bool:
     error = DownloadStorageError(f"{name} must be true or false.")
     error.exit_code = 2
     raise error
-
-
-def _positive_int(value: str) -> int:
-    parsed = _nonnegative_int(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("value must be greater than zero")
-    return parsed
 
 
 def _nonnegative_int(value: str) -> int:
