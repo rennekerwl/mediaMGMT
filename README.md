@@ -31,7 +31,7 @@ infohash.
 
 - Python 3.12 or newer
 - A TMDb API Read Access Token for scope generation
-- A published Google Sheet CSV for movie recommendations
+- A Google Sheet shared with a single-purpose Google service account
 - A running, user-configured Jackett service for movie and complete-series searches
 - A running rTorrent instance exposed through a user-secured HTTP(S) XML-RPC gateway
   for live health probes
@@ -75,21 +75,30 @@ The `.env` file is ignored by Git. The token may instead be set directly in the
 process environment. It is sent only as an `Authorization: Bearer` header and is
 never logged.
 
-## Movie recommendation configuration
+## Movie recommendation and acquisition-history configuration
 
-Publish the ratings tab of the Google Sheet as CSV, then configure its CSV URL and
-the local movies folder in `.env`:
+Enable the Google Sheets API in a Google Cloud project and create a
+[single-purpose service account](https://developers.google.com/identity/protocols/oauth2/service-account).
+Create a JSON key, store its compact one-line JSON directly in `.env`, then share the
+spreadsheet with the service account's generated `iam.gserviceaccount.com` address as
+an editor. A share granted to an ordinary Gmail address does not grant the service
+account access.
+
+Configure the spreadsheet, tab, credentials file, and local directories in `.env`:
 
 ```dotenv
 MOVIES_DIRECTORY=C:\Media\Movies
 RECOMMENDATIONS_DIRECTORY=C:\Media
-GOOGLE_SHEET_CSV_URL=https://docs.google.com/spreadsheets/d/.../pub?output=csv
+GOOGLE_SHEET_ID=13sBLIZZFd3xbMyFyYZ6yYSYYPUby79X9VOY4-i5vF2I
+GOOGLE_SHEET_TAB=Sheet1
+GOOGLE_SERVICE_ACCOUNT_JSON={"type":"service_account",...}
 ```
 
-The CSV requires `Title` and `Rating` columns. `Year` is optional and `Notes` is
-ignored. Ratings are whole numbers: 1 means hated it, 2 disliked it, 3 neutral,
-4 liked it, and 5 loved it. Ratings 4 and 5 seed recommendations, while every
-resolved rated movie is excluded from the output. A rating of 5 contributes 1.5
+`Sheet1` must use `Title | Year | Rating | Notes | TMDb ID`. Ratings are whole
+numbers: 1 means hated it, 2 disliked it, 3 neutral, 4 liked it, and 5 loved it.
+Ratings 4 and 5 seed recommendations. A blank rating with a valid TMDb ID means the
+movie was acquired but has not been rated, so it is excluded without influencing
+recommendations. Every recorded TMDb ID is excluded. A rating of 5 contributes 1.5
 times the recommendation weight of a rating of 4.
 
 Run one check with either installed entry point:
@@ -204,7 +213,7 @@ media-recommend | python -m media_scope.movie_search | python -m media_scope.mov
 To transfer the completed movie locally and clean it from the seedbox, append Step 7:
 
 ```powershell
-media-recommend | python -m media_scope.movie_search | python -m media_scope.movie_probe | media-download-torrent | media-transfer-movie
+media-recommend | python -m media_scope.movie_search | python -m media_scope.movie_probe | media-download-torrent | media-transfer-movie | media-record-movie
 ```
 
 ## Checkpointed movie-flow orchestration
@@ -229,9 +238,11 @@ never automatically deleted. A second `run` exits successfully with
 
 Recommendation and search failures that are safe to repeat remain retryable. An
 interrupted download is restarted from its saved probe handoff and uses Step 6's
-existing deterministic job identity. An interrupted probe or transfer, a stalled or
-unsafe download, and every transfer failure stop as `ATTENTION_REQUIRED` because
-external state may need inspection.
+existing deterministic job identity. A verified transfer advances to an idempotent
+Google Sheets history stage. If that write fails, later runs retry only history and
+never repeat the transfer. An interrupted probe or transfer, a stalled or unsafe
+download, and transfer failures stop as `ATTENTION_REQUIRED` because external state
+may need inspection.
 
 After correcting a resumable download or transfer problem, use the run ID reported by
 `status`:
@@ -250,9 +261,11 @@ media-movie-flow clear `
   --pretty
 ```
 
-`clear` changes only orchestration state. It never removes torrents, local or remote
-files, or run history. A `transfer_completed_cleanup_failed` result cannot be resumed;
-complete its reported seedbox cleanup manually and then clear the run.
+`clear` applies to attention or retryable failures and changes only orchestration
+state. It never removes torrents, local or remote files, or run history. A
+`transfer_completed_cleanup_failed` result is recorded in Sheets before cleanup
+attention is returned and cannot be resumed; complete its reported seedbox cleanup
+manually and then clear the run.
 
 The orchestrator uses these process exit codes:
 

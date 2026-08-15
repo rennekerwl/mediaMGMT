@@ -80,6 +80,7 @@ def main(
     payload: JsonObject
     exit_code = 9
     job_id: str | None = None
+    scope: JsonObject | None = None
     try:
         handoff = (
             load_transfer_input(args.download_result)
@@ -89,6 +90,7 @@ def main(
             )
         )
         job_id = handoff.job_id
+        scope = dict(handoff.scope)
         movies_text = os.getenv("MOVIES_DIRECTORY", "").strip()
         if not movies_text:
             raise TransferInputError("MOVIES_DIRECTORY is missing.")
@@ -120,7 +122,7 @@ def main(
             ).run(handoff)
         exit_code = 0
     except TransferCleanupError as exc:
-        payload = _cleanup_error_payload(exc, job_id=job_id)
+        payload = _cleanup_error_payload(exc, job_id=job_id, scope=scope)
         exit_code = exc.exit_code
     except TransferError as exc:
         payload = _error_payload(
@@ -199,7 +201,9 @@ def _error_payload(
     return payload
 
 
-def _cleanup_error_payload(error: TransferCleanupError, *, job_id: str | None) -> JsonObject:
+def _cleanup_error_payload(
+    error: TransferCleanupError, *, job_id: str | None, scope: JsonObject | None
+) -> JsonObject:
     cleanup: JsonObject = {
         "status": "FAILED",
         "torrent_removed": getattr(error, "torrent_removed", None),
@@ -218,6 +222,8 @@ def _cleanup_error_payload(error: TransferCleanupError, *, job_id: str | None) -
     }
     if job_id:
         payload["job_id"] = job_id
+    if scope is not None:
+        payload["scope"] = scope
     return payload
 
 

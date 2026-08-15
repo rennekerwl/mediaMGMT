@@ -13,11 +13,15 @@ from datetime import date
 from pathlib import Path
 from typing import Protocol
 
-import httpx
 from dotenv import load_dotenv
 
 from media_scope.client import TmdbClient
 from media_scope.exceptions import TmdbError
+from media_scope.google_sheets import (
+    GoogleSheetError,
+    GoogleSheetsClient,
+    create_google_sheets_client,
+)
 from media_scope.models import JsonObject
 from media_scope.recommendations import (
     MOVIE_TRIGGER_COUNT,
@@ -28,13 +32,13 @@ from media_scope.recommendations import (
     build_recommendations,
     count_movies,
     format_recommendations,
-    parse_ratings_csv,
+    parse_movie_sheet,
 )
 from media_scope.serialization import configure_utf8_stdio, serialize_json
 
 LOGGER = logging.getLogger("media_scope.recommend")
 RECOMMENDATIONS_FILENAME = "RECOMMENDATIONS.txt"
-CsvFetcher = Callable[[str], str]
+SheetClientFactory = Callable[[], GoogleSheetsClient]
 
 
 class ClientContext(AbstractContextManager[RecommendationClient], Protocol):
@@ -54,24 +58,11 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def fetch_published_csv(url: str) -> str:
-    """Download one published Google Sheet CSV."""
-    try:
-        with httpx.Client(timeout=15.0, follow_redirects=True) as client:
-            response = client.get(url)
-            response.raise_for_status()
-            return response.text
-    except httpx.HTTPError as exc:
-        raise RecommendationInputError(
-            "The published Google Sheet CSV could not be downloaded."
-        ) from exc
-
-
 def main(
     argv: Sequence[str] | None = None,
     *,
     client_factory: ClientFactory | None = None,
-    csv_fetcher: CsvFetcher = fetch_published_csv,
+    sheet_client_factory: SheetClientFactory | None = None,
     today: date | None = None,
 ) -> int:
     """Run one folder check and return zero on success."""
@@ -118,30 +109,29 @@ def main(
         LOGGER.error("RECOMMENDATIONS_DIRECTORY does not identify an accessible directory.")
         return 2
 
-    csv_url = os.getenv("GOOGLE_SHEET_CSV_URL", "").strip()
     token = os.getenv("TMDB_BEARER_TOKEN", "").strip()
-    if not csv_url:
-        LOGGER.error(
-            "GOOGLE_SHEET_CSV_URL is missing. Configure it in the environment or .env file."
-        )
-        return 2
     if not token:
         LOGGER.error("TMDB_BEARER_TOKEN is missing. Configure it in the environment or .env file.")
         return 2
 
     try:
-        ratings = parse_ratings_csv(csv_fetcher(csv_url), LOGGER.warning)
+        sheet_client = (sheet_client_factory or create_google_sheets_client)()
+        sheet_data = parse_movie_sheet(sheet_client.read_movie_rows(), LOGGER.warning)
         factory = client_factory or TmdbClient
         with factory(token) as client:
             recommendations = build_recommendations(
                 client,
-                ratings,
+                sheet_data.ratings,
                 today=today or date.today(),
                 warn=LOGGER.warning,
+                excluded_ids=sheet_data.acquired_ids,
             )
     except RecommendationInputError as exc:
         LOGGER.error("%s", exc)
         return 2
+    except GoogleSheetError:
+        LOGGER.error("Google Sheets ratings could not be read.")
+        return 4
     except TmdbError as exc:
         LOGGER.error("TMDb recommendation request failed: %s", exc)
         return 4
