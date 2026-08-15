@@ -55,6 +55,8 @@ class FakeRunner:
                 "working_directory": working_directory,
             }
         )
+        if module == "media_scope.movie_history" and not self.outcomes[module]:
+            self.add(module, 0, history_payload())
         exit_code, outcome = self.outcomes[module].popleft()
         stderr_path.write_text(f"log for {module}\n", encoding="utf-8")
         if isinstance(outcome, BaseException):
@@ -97,7 +99,16 @@ def download_payload() -> dict[str, Any]:
 
 
 def transfer_payload() -> dict[str, Any]:
-    return {"schema_version": 1, "result": "transfer_completed"}
+    return {
+        "schema_version": 1,
+        "result": "transfer_completed",
+        "scope": {"media_type": "movie", "tmdb_id": 1, "title": "Movie", "year": 2000},
+        "transfer": {"status": "COMPLETED"},
+    }
+
+
+def history_payload(result: str = "movie_history_recorded") -> dict[str, Any]:
+    return {"schema_version": 1, "result": result}
 
 
 def add_happy_path(runner: FakeRunner) -> None:
@@ -131,18 +142,20 @@ def test_happy_path_persists_exact_handoffs_logs_and_manifest(tmp_path: Path) ->
         "media_scope.movie_probe",
         "media_scope.download_torrent",
         "media_scope.movie_transfer",
+        "media_scope.movie_history",
     ]
     assert json.loads(runner.calls[1]["input"]) == recommendation_payload()
     assert json.loads(runner.calls[2]["input"]) == search_payload()
     assert json.loads(runner.calls[3]["input"]) == probe_payload()
     assert json.loads(runner.calls[4]["input"]) == download_payload()
+    assert json.loads(runner.calls[5]["input"]) == transfer_payload()
 
     run_directory = Path(payload["artifact_directory"])
     manifest = json.loads((run_directory / "manifest.json").read_text(encoding="utf-8"))
     latest = json.loads((tmp_path / "flow" / "latest-status.json").read_text(encoding="utf-8"))
     assert manifest == latest == payload
-    assert len(list(run_directory.glob("*.json"))) == 6
-    assert len(list(run_directory.glob("*.stderr.log"))) == 5
+    assert len(list(run_directory.glob("*.json"))) == 7
+    assert len(list(run_directory.glob("*.stderr.log"))) == 6
     assert not list(run_directory.glob("*.partial"))
 
 
@@ -306,7 +319,7 @@ def test_completed_transfer_artifact_is_evaluated_after_crash_without_retransfer
     recovered, code = orchestrator(tmp_path, recovery_runner).run()
 
     assert (code, recovered["state"]) == (EXIT_OK, STATE_COMPLETED)
-    assert not recovery_runner.calls
+    assert [call["module"] for call in recovery_runner.calls] == ["media_scope.movie_history"]
 
 
 def test_stalled_download_resume_forwards_resume_stalled(tmp_path: Path) -> None:
@@ -391,12 +404,25 @@ def test_cleanup_failure_cannot_resume_and_clear_is_non_destructive(tmp_path: Pa
             "schema_version": 1,
             "result": "transfer_completed_cleanup_failed",
             "error_code": "SEEDBOX_CLEANUP_FAILED",
+            "message": "cleanup failed",
+            "scope": {
+                "media_type": "movie",
+                "tmdb_id": 1,
+                "title": "Movie",
+                "year": 2000,
+            },
+            "transfer": {"status": "COMPLETED"},
         },
     )
     flow = orchestrator(tmp_path, runner)
     blocked, code = flow.run()
 
     assert code == EXIT_ATTENTION
+    assert [call["module"] for call in runner.calls][-2:] == [
+        "media_scope.movie_transfer",
+        "media_scope.movie_history",
+    ]
+    assert blocked["stages"]["history"]["status"] == "SUCCEEDED"
     with pytest.raises(FlowManifestError, match="cannot be retransferred"):
         flow.resume(str(blocked["run_id"]))
 
@@ -404,6 +430,53 @@ def test_cleanup_failure_cannot_resume_and_clear_is_non_destructive(tmp_path: Pa
     assert (clear_code, cleared["state"]) == (EXIT_OK, STATE_CLEARED)
     assert Path(cleared["artifact_directory"]).is_dir()
     assert cleared["clear_reason"] == "Cleaned seedbox manually"
+
+
+def test_history_failure_retries_only_history_without_retransfer(tmp_path: Path) -> None:
+    runner = FakeRunner()
+    add_happy_path(runner)
+    runner.add(
+        "media_scope.movie_history",
+        4,
+        {
+            "schema_version": 1,
+            "result": "movie_history_failed",
+            "error_code": "GOOGLE_SHEET_REQUEST_FAILED",
+            "message": "The Google Sheet could not be updated.",
+        },
+    )
+    flow = orchestrator(tmp_path, runner)
+
+    blocked, blocked_code = flow.run()
+    assert (blocked_code, blocked["state"], blocked["current_stage"]) == (
+        EXIT_RETRYABLE,
+        STATE_RETRYABLE,
+        "history",
+    )
+
+    runner.add("media_scope.movie_history", 0, history_payload("movie_history_already_recorded"))
+    completed, completed_code = flow.run()
+
+    assert (completed_code, completed["state"]) == (EXIT_OK, STATE_COMPLETED)
+    modules = [call["module"] for call in runner.calls]
+    assert modules.count("media_scope.movie_transfer") == 1
+    assert modules.count("media_scope.movie_history") == 2
+
+
+def test_interrupted_history_is_replayed_without_retransfer(tmp_path: Path) -> None:
+    runner = FakeRunner()
+    add_happy_path(runner)
+    runner.add("media_scope.movie_history", 1, RuntimeError("simulated reboot"))
+    flow = orchestrator(tmp_path, runner)
+
+    with pytest.raises(RuntimeError, match="simulated reboot"):
+        flow.run()
+    completed, code = flow.run()
+
+    assert (code, completed["state"]) == (EXIT_OK, STATE_COMPLETED)
+    modules = [call["module"] for call in runner.calls]
+    assert modules.count("media_scope.movie_transfer") == 1
+    assert modules.count("media_scope.movie_history") == 2
 
 
 def test_invalid_probe_output_requires_attention_and_keeps_partial_file(tmp_path: Path) -> None:

@@ -118,6 +118,7 @@ def test_cleanup_failure_is_explicit_partial_success(
     payload = json.loads(capsys.readouterr().out)
     assert code == 7
     assert payload["result"] == "transfer_completed_cleanup_failed"
+    assert payload["scope"]["tmdb_id"] == 1091
     assert payload["transfer"]["status"] == "COMPLETED"
     assert payload["cleanup"]["remaining_remote_paths"] == [source]
 

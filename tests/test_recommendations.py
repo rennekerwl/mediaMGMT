@@ -14,6 +14,7 @@ from media_scope.recommendations import (
     build_recommendations,
     count_movies,
     format_recommendations,
+    parse_movie_sheet,
     parse_ratings_csv,
 )
 
@@ -128,6 +129,52 @@ def test_rating_meanings_and_positive_seed_cutoff() -> None:
 def test_parse_ratings_requires_title_and_rating_headers() -> None:
     with pytest.raises(RecommendationInputError, match="Rating"):
         parse_ratings_csv("Title,Year\nArrival,2016\n", lambda _message: None)
+
+
+def test_parse_movie_sheet_keeps_blank_rating_as_acquired_only() -> None:
+    warnings: list[str] = []
+    parsed = parse_movie_sheet(
+        [
+            ["Title", "Year", "Rating", "Notes", "TMDb ID"],
+            ["Arrival", 2016, 5, "great", 329865],
+            ["Guardians of the Galaxy", 2014, "", "", 118340],
+        ],
+        warnings.append,
+    )
+
+    assert parsed.ratings == [RatingRow("Arrival", 2016, 5, 2, 329865)]
+    assert parsed.acquired_ids == frozenset({329865, 118340})
+    assert warnings == []
+
+
+def test_acquired_ids_are_excluded_without_becoming_seeds() -> None:
+    client = FakeRecommendationClient(
+        searches={},
+        recommendations={
+            1: [
+                movie(118340, "Already Acquired", popularity=100),
+                movie(10, "Fresh", popularity=50, genre_ids=[28]),
+            ]
+        },
+        discoveries={
+            1: [
+                movie(118340, "Already Acquired", popularity=100, vote_average=9),
+                movie(20, "Explore", popularity=20, vote_average=8, genre_ids=[35]),
+                movie(21, "Explore Two", popularity=10, vote_average=7.5, genre_ids=[18]),
+            ]
+        },
+    )
+
+    result = build_recommendations(
+        client,
+        [RatingRow("Seed", 2000, 5, 2, 1)],
+        today=date(2030, 1, 1),
+        warn=lambda _message: None,
+        excluded_ids={118340},
+    )
+
+    assert 118340 not in {item.tmdb_id for item in result}
+    assert client.search_calls == []
 
 
 def test_build_recommendations_resolves_by_popularity_filters_and_ranks() -> None:

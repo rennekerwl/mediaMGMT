@@ -12,6 +12,19 @@ import pytest
 from media_scope.recommend_cli import main
 from media_scope.recommendations import RecommendationInputError
 
+SHEET_ROWS = [
+    ["Title", "Year", "Rating", "Notes", "TMDb ID"],
+    ["Seed", "", 5, "", ""],
+]
+
+
+class FakeSheetClient:
+    def __init__(self, rows: list[list[object]] | None = None) -> None:
+        self.rows = rows or SHEET_ROWS
+
+    def read_movie_rows(self) -> list[list[object]]:
+        return self.rows
+
 
 class CliRecommendationClient:
     def __init__(self, token: str) -> None:
@@ -70,7 +83,6 @@ def configure(
 ) -> None:
     monkeypatch.setenv("MOVIES_DIRECTORY", str(movies))
     monkeypatch.setenv("RECOMMENDATIONS_DIRECTORY", str(recommendations or movies))
-    monkeypatch.setenv("GOOGLE_SHEET_CSV_URL", "https://example.test/sheet.csv")
     monkeypatch.setenv("TMDB_BEARER_TOKEN", "test-token")
     monkeypatch.setattr("media_scope.recommend_cli.load_dotenv", lambda: False)
 
@@ -89,7 +101,7 @@ def test_always_writes_three_recommendations_below_trigger(
     exit_code = main(
         [],
         client_factory=CliRecommendationClient,
-        csv_fetcher=lambda _url: "Title,Rating\nSeed,5\n",
+        sheet_client_factory=FakeSheetClient,
         today=date(2030, 1, 1),
     )
 
@@ -119,13 +131,13 @@ def test_full_folder_skips_network_and_preserves_output(
     output = tmp_path / "RECOMMENDATIONS.txt"
     output.write_text("old contents\n", encoding="utf-8")
 
-    def unexpected_fetch(_url: str) -> str:
-        raise AssertionError("CSV should not be fetched")
+    def unexpected_sheet() -> FakeSheetClient:
+        raise AssertionError("Google Sheets should not be read")
 
     def unexpected_factory(_token: str) -> CliRecommendationClient:
         raise AssertionError("TMDb client should not be created")
 
-    exit_code = main([], client_factory=unexpected_factory, csv_fetcher=unexpected_fetch)
+    exit_code = main([], client_factory=unexpected_factory, sheet_client_factory=unexpected_sheet)
 
     assert exit_code == 0
     assert output.read_text(encoding="utf-8") == "old contents\n"
@@ -147,7 +159,7 @@ def test_counts_movies_and_writes_recommendations_in_separate_directories(
     exit_code = main(
         [],
         client_factory=CliRecommendationClient,
-        csv_fetcher=lambda _url: "Title,Rating\nSeed,5\n",
+        sheet_client_factory=FakeSheetClient,
         today=date(2030, 1, 1),
     )
 
@@ -180,7 +192,7 @@ def test_short_result_is_written_with_warning(
     exit_code = main(
         [],
         client_factory=OneResultClient,
-        csv_fetcher=lambda _url: "Title,Rating\nSeed,5\n",
+        sheet_client_factory=FakeSheetClient,
         today=date(2030, 1, 1),
     )
 
@@ -196,10 +208,13 @@ def test_input_failure_preserves_existing_output(
     output = tmp_path / "RECOMMENDATIONS.txt"
     output.write_text("keep me\n", encoding="utf-8")
 
-    def failed_fetch(_url: str) -> str:
-        raise RecommendationInputError("download failed")
+    class FailedSheetClient(FakeSheetClient):
+        def read_movie_rows(self) -> list[list[object]]:
+            raise RecommendationInputError("read failed")
 
-    exit_code = main([], client_factory=CliRecommendationClient, csv_fetcher=failed_fetch)
+    exit_code = main(
+        [], client_factory=CliRecommendationClient, sheet_client_factory=FailedSheetClient
+    )
 
     assert exit_code != 0
     assert output.read_text(encoding="utf-8") == "keep me\n"
@@ -222,7 +237,7 @@ def test_output_write_failure_preserves_existing_output(
     exit_code = main(
         [],
         client_factory=CliRecommendationClient,
-        csv_fetcher=lambda _url: "Title,Rating\nSeed,5\n",
+        sheet_client_factory=FakeSheetClient,
         today=date(2030, 1, 1),
     )
 

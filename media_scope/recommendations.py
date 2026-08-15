@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 import io
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -59,6 +59,7 @@ class RatingRow:
     year: int | None
     rating: int
     row_number: int
+    tmdb_id: int | None = None
 
     @property
     def sentiment(self) -> str:
@@ -83,6 +84,14 @@ class Recommendation:
     popularity: float
     vote_average: float
     vote_count: int
+
+
+@dataclass(frozen=True)
+class MovieSheetData:
+    """Rated recommendation seeds plus every previously acquired TMDb ID."""
+
+    ratings: list[RatingRow]
+    acquired_ids: frozenset[int]
 
 
 def count_movies(directory: Path) -> int:
@@ -155,28 +164,102 @@ def parse_ratings_csv(csv_text: str, warn: WarningHandler) -> list[RatingRow]:
     return ratings
 
 
+def parse_movie_sheet(rows: Sequence[Sequence[object]], warn: WarningHandler) -> MovieSheetData:
+    """Parse authenticated Sheet values into rated seeds and acquisition exclusions."""
+    if not rows:
+        raise RecommendationInputError("The Google Sheet has no header row.")
+    headers = {
+        str(value).strip().casefold(): index
+        for index, value in enumerate(rows[0])
+        if value is not None
+    }
+    missing = {"title", "year", "rating", "notes", "tmdb id"} - headers.keys()
+    if missing:
+        names = ", ".join(sorted(name.title() for name in missing))
+        raise RecommendationInputError(f"The Google Sheet is missing required column(s): {names}.")
+
+    ratings: list[RatingRow] = []
+    acquired_ids: set[int] = set()
+    for row_number, row in enumerate(rows[1:], start=2):
+        if not any(_cell_text(value) for value in row):
+            continue
+        title = _sheet_cell(row, headers["title"])
+        year_text = _sheet_cell(row, headers["year"])
+        rating_text = _sheet_cell(row, headers["rating"])
+        tmdb_text = _sheet_cell(row, headers["tmdb id"])
+
+        tmdb_id = _parse_positive_int_text(tmdb_text)
+        if tmdb_text and tmdb_id is None:
+            warn(f"Sheet row {row_number}: TMDb ID must be a positive integer; skipping row.")
+            continue
+        if tmdb_id is not None:
+            acquired_ids.add(tmdb_id)
+
+        if not rating_text:
+            if tmdb_id is None:
+                warn(
+                    f"Sheet row {row_number}: blank Rating requires a valid TMDb ID; skipping row."
+                )
+            continue
+        if not title:
+            warn(f"Sheet row {row_number}: missing Title; skipping row.")
+            continue
+        try:
+            rating = int(rating_text)
+        except ValueError:
+            rating = 0
+        if rating not in RATING_LABELS or str(rating) != rating_text:
+            warn(
+                f"Sheet row {row_number}: Rating must be a whole number from 1 to 5; skipping row."
+            )
+            continue
+
+        year: int | None = None
+        if year_text:
+            try:
+                year = int(year_text)
+            except ValueError:
+                year = None
+            if year is None or not 1000 <= year <= 9999 or str(year) != year_text:
+                warn(f"Sheet row {row_number}: Year must be a four-digit year; skipping row.")
+                continue
+        ratings.append(
+            RatingRow(
+                title=title,
+                year=year,
+                rating=rating,
+                row_number=row_number,
+                tmdb_id=tmdb_id,
+            )
+        )
+    return MovieSheetData(ratings=ratings, acquired_ids=frozenset(acquired_ids))
+
+
 def build_recommendations(
     client: RecommendationClient,
     ratings: list[RatingRow],
     *,
     today: date,
     warn: WarningHandler,
+    excluded_ids: Collection[int] = (),
 ) -> list[Recommendation]:
     """Build two personalized choices followed by one broader exploration choice."""
-    rated_ids: set[int] = set()
+    rated_ids: set[int] = set(excluded_ids)
     seed_weights: dict[int, float] = {}
 
     for rating in ratings:
-        results = client.search_movies(rating.title, rating.year)
-        resolved = _most_popular_valid_result(results)
-        if resolved is None:
-            suffix = f" ({rating.year})" if rating.year is not None else ""
-            warn(
-                f"Sheet row {rating.row_number}: TMDb found no usable movie for "
-                f'"{rating.title}{suffix}"; skipping row.'
-            )
-            continue
-        tmdb_id = int(resolved["id"])
+        tmdb_id = rating.tmdb_id
+        if tmdb_id is None:
+            results = client.search_movies(rating.title, rating.year)
+            resolved = _most_popular_valid_result(results)
+            if resolved is None:
+                suffix = f" ({rating.year})" if rating.year is not None else ""
+                warn(
+                    f"Sheet row {rating.row_number}: TMDb found no usable movie for "
+                    f'"{rating.title}{suffix}"; skipping row.'
+                )
+                continue
+            tmdb_id = int(resolved["id"])
         rated_ids.add(tmdb_id)
         if rating.liked:
             weight = 1.5 if rating.rating == 5 else 1.0
@@ -408,3 +491,19 @@ def _finite_number(value: object, default: float | None = None) -> float | None:
         if math.isfinite(number):
             return number
     return default
+
+
+def _sheet_cell(row: Sequence[object], index: int) -> str:
+    return _cell_text(row[index]) if index < len(row) else ""
+
+
+def _cell_text(value: object) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def _parse_positive_int_text(value: str) -> int | None:
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed > 0 and str(parsed) == value else None

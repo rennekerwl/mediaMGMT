@@ -41,7 +41,7 @@ STATE_NO_ACQUISITION = "NO_ACQUISITION_AVAILABLE"
 STATE_CLEARED = "CLEARED"
 
 TERMINAL_STATES = {STATE_COMPLETED, STATE_NO_ACTION, STATE_NO_ACQUISITION, STATE_CLEARED}
-SAFE_INTERRUPTED_STAGES = {"recommendations", "search", "download"}
+SAFE_INTERRUPTED_STAGES = {"recommendations", "search", "download", "history"}
 
 
 class FlowError(Exception):
@@ -72,6 +72,7 @@ STAGES = (
     StageSpec("probe", 3, "media_scope.movie_probe", "movie-probe"),
     StageSpec("download", 4, "media_scope.download_torrent", "download"),
     StageSpec("transfer", 5, "media_scope.movie_transfer", "transfer"),
+    StageSpec("history", 6, "media_scope.movie_history", "movie-history"),
 )
 STAGE_BY_KEY = {stage.key: stage for stage in STAGES}
 
@@ -235,8 +236,10 @@ class MovieFlowOrchestrator:
             if not acquired:
                 return self._already_running(), EXIT_OK
             manifest = self._load_current_run(run_id)
-            if manifest.get("state") != STATE_ATTENTION:
-                raise FlowManifestError("Only an ATTENTION_REQUIRED run can be cleared.")
+            if manifest.get("state") not in {STATE_ATTENTION, STATE_RETRYABLE}:
+                raise FlowManifestError(
+                    "Only an ATTENTION_REQUIRED or RETRYABLE_FAILURE run can be cleared."
+                )
             manifest.update(
                 {
                     "state": STATE_CLEARED,
@@ -488,22 +491,71 @@ class MovieFlowOrchestrator:
                 attention=exit_code != 4,
             )
 
-        if exit_code == 0 and result == "transfer_completed":
-            return self._finish(
+        if stage.key == "transfer":
+            if exit_code == 0 and result == "transfer_completed":
+                manifest["post_history_outcome"] = {
+                    "type": "completed",
+                    "message": "The movie was transferred and seedbox cleanup completed.",
+                }
+                self._advance(manifest, stage)
+                return None
+            transfer = payload.get("transfer") if payload else None
+            if (
+                result == "transfer_completed_cleanup_failed"
+                and isinstance(transfer, dict)
+                and transfer.get("status") == "COMPLETED"
+            ):
+                manifest["post_history_outcome"] = {
+                    "type": "cleanup_attention",
+                    "error_code": error_code or "SEEDBOX_CLEANUP_FAILED",
+                    "message": message or "The local copy completed but seedbox cleanup failed.",
+                }
+                self._advance(manifest, stage, completed_status="PARTIAL_SUCCESS")
+                return None
+            return self._stage_failure(
                 manifest,
-                state=STATE_COMPLETED,
-                result="flow_completed",
-                message="The movie was transferred and seedbox cleanup completed.",
+                stage,
+                error_code=error_code or "TRANSFER_STAGE_FAILED",
+                message=message or "The movie-transfer stage failed.",
+                attention=True,
+                resume_allowed=True,
             )
-        cleanup_completed = result == "transfer_completed_cleanup_failed"
-        return self._stage_failure(
-            manifest,
-            stage,
-            error_code=error_code or "TRANSFER_STAGE_FAILED",
-            message=message or "The movie-transfer stage failed.",
-            attention=True,
-            resume_allowed=not cleanup_completed,
-        )
+
+        if stage.key == "history":
+            if exit_code == 0 and result in {
+                "movie_history_recorded",
+                "movie_history_already_recorded",
+            }:
+                outcome = manifest.get("post_history_outcome")
+                if isinstance(outcome, dict) and outcome.get("type") == "cleanup_attention":
+                    self._stage_record(manifest, "history")["status"] = "SUCCEEDED"
+                    return self._stage_failure(
+                        manifest,
+                        STAGE_BY_KEY["transfer"],
+                        error_code=str(outcome.get("error_code") or "SEEDBOX_CLEANUP_FAILED"),
+                        message=str(
+                            outcome.get("message")
+                            or "The local copy completed but seedbox cleanup failed."
+                        ),
+                        attention=True,
+                        resume_allowed=False,
+                        stage_status="PARTIAL_SUCCESS",
+                    )
+                return self._finish(
+                    manifest,
+                    state=STATE_COMPLETED,
+                    result="flow_completed",
+                    message="The movie was transferred and recorded in acquisition history.",
+                )
+            return self._stage_failure(
+                manifest,
+                stage,
+                error_code=error_code or "MOVIE_HISTORY_STAGE_FAILED",
+                message=message or "The movie-history stage failed.",
+                attention=False,
+            )
+
+        raise FlowManifestError(f"No evaluator exists for stage {stage.key}.")
 
     def _stage_failure(
         self,
@@ -514,9 +566,10 @@ class MovieFlowOrchestrator:
         message: str,
         attention: bool,
         resume_allowed: bool | None = None,
+        stage_status: str = "FAILED",
     ) -> tuple[JsonObject, int]:
         stage_record = self._stage_record(manifest, stage.key)
-        stage_record["status"] = "FAILED"
+        stage_record["status"] = stage_status
         if attention:
             allowed = (
                 resume_allowed
@@ -622,9 +675,11 @@ class MovieFlowOrchestrator:
             resume_allowed=stage_key == "transfer",
         )
 
-    def _advance(self, manifest: JsonObject, completed: StageSpec) -> None:
+    def _advance(
+        self, manifest: JsonObject, completed: StageSpec, *, completed_status: str = "SUCCEEDED"
+    ) -> None:
         stage_record = self._stage_record(manifest, completed.key)
-        stage_record["status"] = "SUCCEEDED"
+        stage_record["status"] = completed_status
         if completed.key == "download":
             manifest.pop("resume_stalled_authorized", None)
         next_stage = STAGES[completed.position]
@@ -790,6 +845,9 @@ class MovieFlowOrchestrator:
             raise FlowManifestError(f"Movie-flow manifest has an invalid run ID: {path}")
         if expected_run_id is not None and run_id != expected_run_id:
             raise FlowManifestError("The requested run ID does not match its manifest.")
+        stages = decoded.get("stages")
+        if isinstance(stages, dict) and "history" not in stages:
+            stages["history"] = {"position": 6, "status": "PENDING", "attempts": []}
         self._stage_key(decoded)
         return decoded
 
