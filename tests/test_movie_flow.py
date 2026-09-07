@@ -15,7 +15,6 @@ from media_scope.movie_flow import (
     EXIT_OK,
     EXIT_RETRYABLE,
     STATE_ATTENTION,
-    STATE_CLEARED,
     STATE_COMPLETED,
     STATE_NO_ACQUISITION,
     STATE_NO_ACTION,
@@ -79,7 +78,16 @@ def recommendation_payload(result: str = "recommendations_created") -> dict[str,
 
 
 def search_payload() -> dict[str, Any]:
-    return {"schema_version": 1, "result": "movie_search_completed", "movies": []}
+    return {
+        "schema_version": 1,
+        "result": "movie_search_completed",
+        "movies": [
+            {
+                "recommendation": {"tmdb_id": 1, "title": "Movie", "year": 2000},
+                "results": [],
+            }
+        ],
+    }
 
 
 def probe_payload() -> dict[str, Any]:
@@ -303,7 +311,7 @@ def test_completed_transfer_artifact_is_evaluated_after_crash_without_retransfer
     runner = FakeRunner()
     add_happy_path(runner)
     flow = orchestrator(tmp_path, runner)
-    original_evaluate = flow._evaluate_stage
+    original_evaluate = flow._evaluate_batch_stage
 
     def crash_after_transfer(*args: Any, **kwargs: Any) -> Any:
         stage = args[1]
@@ -311,7 +319,7 @@ def test_completed_transfer_artifact_is_evaluated_after_crash_without_retransfer
             raise RuntimeError("crash after transfer output")
         return original_evaluate(*args, **kwargs)
 
-    monkeypatch.setattr(flow, "_evaluate_stage", crash_after_transfer)
+    monkeypatch.setattr(flow, "_evaluate_batch_stage", crash_after_transfer)
     with pytest.raises(RuntimeError, match="crash after transfer output"):
         flow.run()
 
@@ -391,7 +399,7 @@ def test_authorized_stalled_resume_survives_retryable_connection_failure(tmp_pat
     assert all("--resume-stalled" in call["command"] for call in download_calls[1:])
 
 
-def test_cleanup_failure_cannot_resume_and_clear_is_non_destructive(tmp_path: Path) -> None:
+def test_cleanup_failure_clear_acknowledges_and_completes_batch(tmp_path: Path) -> None:
     runner = FakeRunner()
     runner.add("media_scope.recommend_cli", 0, recommendation_payload())
     runner.add("media_scope.movie_search", 0, search_payload())
@@ -427,7 +435,7 @@ def test_cleanup_failure_cannot_resume_and_clear_is_non_destructive(tmp_path: Pa
         flow.resume(str(blocked["run_id"]))
 
     cleared, clear_code = flow.clear(str(blocked["run_id"]), "Cleaned seedbox manually")
-    assert (clear_code, cleared["state"]) == (EXIT_OK, STATE_CLEARED)
+    assert (clear_code, cleared["state"]) == (EXIT_OK, STATE_COMPLETED)
     assert Path(cleared["artifact_directory"]).is_dir()
     assert cleared["clear_reason"] == "Cleaned seedbox manually"
 

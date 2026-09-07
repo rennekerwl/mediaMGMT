@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from media_scope.movie_search import MovieSearchInputError, load_recommendations
 from media_scope.recommend_cli import main
-from media_scope.recommendations import RecommendationInputError
+from media_scope.recommendations import Recommendation, RecommendationInputError
 
 SHEET_ROWS = [
     ["Title", "Year", "Rating", "Notes", "TMDb ID"],
@@ -84,7 +86,47 @@ def configure(
     monkeypatch.setenv("MOVIES_DIRECTORY", str(movies))
     monkeypatch.setenv("RECOMMENDATIONS_DIRECTORY", str(recommendations or movies))
     monkeypatch.setenv("TMDB_BEARER_TOKEN", "test-token")
+    monkeypatch.delenv("RECOMMENDATION_ENGINE", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_MODEL", raising=False)
     monkeypatch.setattr("media_scope.recommend_cli.load_dotenv", lambda: False)
+
+
+def llm_selection() -> SimpleNamespace:
+    recommendation = Recommendation(
+        tmdb_id=10,
+        title="LLM Pick",
+        year=2020,
+        weighted_support=1.5,
+        genre_ids=frozenset({18}),
+        popularity=20.0,
+        vote_average=7.5,
+        vote_count=1000,
+    )
+    return SimpleNamespace(
+        recommendations=[recommendation],
+        reasons={10: "Matches the user's stated preference."},
+        method="llm",
+        candidate_count=4,
+    )
+
+
+class SelectorClient:
+    calls: list[tuple[str, str]] = []
+    entered = 0
+    exited = 0
+
+    def __init__(self, api_key: str, model: str) -> None:
+        self.api_key = api_key
+        self.model = model
+        type(self).calls.append((api_key, model))
+
+    def __enter__(self) -> SelectorClient:
+        type(self).entered += 1
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        type(self).exited += 1
 
 
 @pytest.mark.parametrize("existing_count", [0, 1, 2])
@@ -252,3 +294,194 @@ def test_missing_movies_directory_is_configuration_error(
     monkeypatch.setattr("media_scope.recommend_cli.load_dotenv", lambda: False)
 
     assert main([]) == 2
+
+
+@pytest.mark.parametrize("folder_count", [None, 4])
+def test_preview_uses_llm_without_folder_checks_or_file_writes(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    folder_count: int | None,
+) -> None:
+    configure(monkeypatch, tmp_path)
+    if folder_count is None:
+        monkeypatch.delenv("MOVIES_DIRECTORY", raising=False)
+    else:
+        movies = tmp_path / "movies"
+        movies.mkdir()
+        for index in range(folder_count):
+            (movies / f"Existing {index}").mkdir()
+        monkeypatch.setenv("MOVIES_DIRECTORY", str(movies))
+    monkeypatch.delenv("RECOMMENDATIONS_DIRECTORY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "preview-key")
+    monkeypatch.setenv("OPENROUTER_MODEL", "preview-model")
+    monkeypatch.setattr(
+        "media_scope.recommend_cli.build_llm_recommendations",
+        lambda *_args, **_kwargs: llm_selection(),
+    )
+
+    SelectorClient.calls = []
+    SelectorClient.entered = 0
+    SelectorClient.exited = 0
+    exit_code = main(
+        ["--preview"],
+        client_factory=CliRecommendationClient,
+        sheet_client_factory=FakeSheetClient,
+        selector_client_factory=SelectorClient,
+        today=date(2030, 1, 1),
+    )
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert exit_code == 0
+    assert payload == {
+        "schema_version": 1,
+        "result": "recommendations_preview",
+        "picks": [{"tmdb_id": 10, "title": "LLM Pick", "year": 2020}],
+        "reasons": {"10": "Matches the user's stated preference."},
+        "model": "preview-model",
+        "candidate_count": 4,
+        "method": "llm",
+        "fallback": False,
+    }
+    assert "recommendations" not in payload
+    with pytest.raises(MovieSearchInputError):
+        load_recommendations(captured.out)
+    assert not (tmp_path / "RECOMMENDATIONS.txt").exists()
+    assert SelectorClient.calls == [("preview-key", "preview-model")]
+    assert SelectorClient.entered == SelectorClient.exited == 1
+
+
+@pytest.mark.parametrize("missing", ["OPENROUTER_API_KEY", "OPENROUTER_MODEL"])
+def test_preview_requires_openrouter_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    missing: str,
+) -> None:
+    configure(monkeypatch, tmp_path)
+    monkeypatch.delenv("MOVIES_DIRECTORY", raising=False)
+    monkeypatch.delenv("RECOMMENDATIONS_DIRECTORY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "configured-key")
+    monkeypatch.setenv("OPENROUTER_MODEL", "configured-model")
+    monkeypatch.delenv(missing, raising=False)
+
+    assert main(["--preview"]) == 2
+    assert "OPENROUTER_" in capsys.readouterr().err
+
+
+def test_llm_engine_preserves_production_handoff_and_logs_reasons(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    configure(monkeypatch, tmp_path)
+    monkeypatch.setenv("RECOMMENDATION_ENGINE", "llm")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "configured-key")
+    monkeypatch.setenv("OPENROUTER_MODEL", "configured-model")
+    monkeypatch.setattr(
+        "media_scope.recommend_cli.build_llm_recommendations",
+        lambda *_args, **_kwargs: llm_selection(),
+    )
+
+    exit_code = main(
+        ["--verbose"],
+        client_factory=CliRecommendationClient,
+        sheet_client_factory=FakeSheetClient,
+        selector_client_factory=SelectorClient,
+        today=date(2030, 1, 1),
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.out == (
+        '{"schema_version":1,"result":"recommendations_created",'
+        '"recommendations":[{"tmdb_id":10,"title":"LLM Pick","year":2020}]}\n'
+    )
+    assert "recommendation_method=llm" in captured.err
+    assert "recommendation_reason tmdb_id=10" in captured.err
+    assert "Matches the user's stated preference." in captured.err
+    assert "configured-key" not in captured.err
+
+
+def test_legacy_engine_is_default_and_does_not_create_selector(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    configure(monkeypatch, tmp_path)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "configured-key")
+    monkeypatch.setenv("OPENROUTER_MODEL", "configured-model")
+
+    def unexpected_selector(_api_key: str, _model: str) -> SelectorClient:
+        raise AssertionError("legacy is the default engine")
+
+    exit_code = main(
+        [],
+        client_factory=CliRecommendationClient,
+        sheet_client_factory=FakeSheetClient,
+        selector_client_factory=unexpected_selector,
+        today=date(2030, 1, 1),
+    )
+
+    assert exit_code == 0
+    assert (tmp_path / "RECOMMENDATIONS.txt").exists()
+
+
+def test_full_folder_skips_llm_credentials_and_all_clients(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    configure(monkeypatch, tmp_path)
+    monkeypatch.setenv("RECOMMENDATION_ENGINE", "llm")
+    monkeypatch.delenv("TMDB_BEARER_TOKEN", raising=False)
+    for index in range(3):
+        (tmp_path / f"Movie {index}.mkv").touch()
+    output = tmp_path / "RECOMMENDATIONS.txt"
+    output.write_text("existing recommendations\n", encoding="utf-8")
+
+    def unexpected_client(*_args: object) -> Any:
+        raise AssertionError("No clients should be created for a full folder")
+
+    assert (
+        main(
+            [],
+            client_factory=unexpected_client,
+            sheet_client_factory=unexpected_client,
+            selector_client_factory=unexpected_client,
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["result"] == "recommendations_not_needed"
+    assert output.read_text(encoding="utf-8") == "existing recommendations\n"
+
+
+def test_preview_preserves_existing_production_file(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    configure(monkeypatch, tmp_path)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "preview-key")
+    monkeypatch.setenv("OPENROUTER_MODEL", "preview-model")
+    monkeypatch.setattr(
+        "media_scope.recommend_cli.build_llm_recommendations",
+        lambda *_args, **_kwargs: llm_selection(),
+    )
+    output = tmp_path / "RECOMMENDATIONS.txt"
+    original = b"existing recommendations\r\n"
+    output.write_bytes(original)
+    before = set(tmp_path.iterdir())
+
+    assert (
+        main(
+            ["--preview"],
+            client_factory=CliRecommendationClient,
+            sheet_client_factory=FakeSheetClient,
+            selector_client_factory=SelectorClient,
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["result"] == "recommendations_preview"
+    assert output.read_bytes() == original
+    assert set(tmp_path.iterdir()) == before
