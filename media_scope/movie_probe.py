@@ -103,10 +103,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output.")
     parser.add_argument("--verbose", action="store_true", help="Log diagnostics to stderr.")
+    parser.add_argument(
+        "--recommendation-rank",
+        type=_positive_argument,
+        metavar="N",
+        help="Probe only recommendation N (a positive integer).",
+    )
     return parser
 
 
-def parse_movie_search(value: Any) -> tuple[MovieProbeCandidate, ...]:
+def parse_movie_search(
+    value: Any, *, recommendation_rank: int | None = None
+) -> tuple[MovieProbeCandidate, ...]:
     """Validate and flatten a movie-search report in deterministic probe order."""
     if not isinstance(value, dict):
         raise MovieProbeInputError("Movie-search input must be a JSON object.")
@@ -117,10 +125,22 @@ def parse_movie_search(value: Any) -> tuple[MovieProbeCandidate, ...]:
     movies = value.get("movies")
     if not isinstance(movies, list):
         raise MovieProbeInputError("Movie-search input must contain a movies array.")
+    if recommendation_rank is not None and _positive_int(recommendation_rank) is None:
+        raise MovieProbeInputError("recommendation_rank must be a positive integer.")
+    if recommendation_rank is not None and recommendation_rank > len(movies):
+        raise MovieProbeInputError(
+            f"Recommendation rank {recommendation_rank} does not exist; "
+            f"the movie-search input contains {len(movies)} recommendation(s)."
+        )
 
     flattened: list[MovieProbeCandidate] = []
     search_order = 0
-    for recommendation_rank, movie in enumerate(movies, start=1):
+    if recommendation_rank is None:
+        movie_entries = enumerate(movies, start=1)
+    else:
+        movie_entries = ((recommendation_rank, movies[recommendation_rank - 1]),)
+
+    for recommendation_rank, movie in movie_entries:
         if not isinstance(movie, dict):
             raise MovieProbeInputError(f"Movie {recommendation_rank} must be an object.")
         recommendation = movie.get("recommendation")
@@ -298,7 +318,7 @@ def main(
             decoded = json.loads(text)
         except json.JSONDecodeError as exc:
             raise MovieProbeInputError("Movie-search input was not valid JSON.") from exc
-        candidates = parse_movie_search(decoded)
+        candidates = parse_movie_search(decoded, recommendation_rank=args.recommendation_rank)
         maximum = _environment_positive_int("RTORRENT_PROBE_MAX_CANDIDATES", 10)
 
         jackett_constructor = jackett_client_factory or JackettClient
@@ -575,6 +595,16 @@ def _new_job_id() -> str:
 
 def _positive_int(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _positive_argument(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 def _year(value: object) -> int | None:

@@ -60,6 +60,7 @@ class RatingRow:
     rating: int
     row_number: int
     tmdb_id: int | None = None
+    notes: str = ""
 
     @property
     def sentiment(self) -> str:
@@ -84,6 +85,7 @@ class Recommendation:
     popularity: float
     vote_average: float
     vote_count: int
+    overview: str | None = None
 
 
 @dataclass(frozen=True)
@@ -122,6 +124,7 @@ def parse_ratings_csv(csv_text: str, warn: WarningHandler) -> list[RatingRow]:
     title_header = headers["title"]
     rating_header = headers["rating"]
     year_header = headers.get("year")
+    notes_header = headers.get("notes")
     ratings: list[RatingRow] = []
 
     for row_number, row in enumerate(reader, start=2):
@@ -159,7 +162,15 @@ def parse_ratings_csv(csv_text: str, warn: WarningHandler) -> list[RatingRow]:
                     warn(f"Sheet row {row_number}: Year must be a four-digit year; skipping row.")
                     continue
 
-        ratings.append(RatingRow(title=title, year=year, rating=rating, row_number=row_number))
+        ratings.append(
+            RatingRow(
+                title=title,
+                year=year,
+                rating=rating,
+                row_number=row_number,
+                notes=(row.get(notes_header) or "").strip() if notes_header else "",
+            )
+        )
 
     return ratings
 
@@ -186,6 +197,7 @@ def parse_movie_sheet(rows: Sequence[Sequence[object]], warn: WarningHandler) ->
         title = _sheet_cell(row, headers["title"])
         year_text = _sheet_cell(row, headers["year"])
         rating_text = _sheet_cell(row, headers["rating"])
+        notes_text = _sheet_cell(row, headers["notes"])
         tmdb_text = _sheet_cell(row, headers["tmdb id"])
 
         tmdb_id = _parse_positive_int_text(tmdb_text)
@@ -230,6 +242,7 @@ def parse_movie_sheet(rows: Sequence[Sequence[object]], warn: WarningHandler) ->
                 rating=rating,
                 row_number=row_number,
                 tmdb_id=tmdb_id,
+                notes=notes_text,
             )
         )
     return MovieSheetData(ratings=ratings, acquired_ids=frozenset(acquired_ids))
@@ -379,6 +392,7 @@ def _candidate_from_payload(
         popularity=popularity,
         vote_average=vote_average,
         vote_count=vote_count,
+        overview=_optional_text(payload.get("overview")),
     )
 
 
@@ -499,6 +513,14 @@ def _sheet_cell(row: Sequence[object], index: int) -> str:
 
 def _cell_text(value: object) -> str:
     return "" if value is None else str(value).strip()
+
+
+def _optional_text(value: object) -> str | None:
+    """Return a trimmed optional string, treating malformed values as absent."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
 
 
 def _parse_positive_int_text(value: str) -> int | None:

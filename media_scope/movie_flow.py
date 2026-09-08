@@ -30,7 +30,8 @@ EXIT_ATTENTION = 3
 EXIT_RETRYABLE = 4
 EXIT_INTERNAL = 5
 
-FLOW_SCHEMA_VERSION = 1
+FLOW_SCHEMA_VERSION = 2
+LEGACY_FLOW_SCHEMA_VERSION = 1
 
 STATE_RUNNING = "RUNNING"
 STATE_RETRYABLE = "RETRYABLE_FAILURE"
@@ -75,6 +76,9 @@ STAGES = (
     StageSpec("history", 6, "media_scope.movie_history", "movie-history"),
 )
 STAGE_BY_KEY = {stage.key: stage for stage in STAGES}
+SHARED_STAGE_KEYS = {"recommendations", "search"}
+ITEM_STAGE_KEYS = {"probe", "download", "transfer", "history"}
+BATCH_TARGET_COUNT = 3
 
 ProcessRunner = Callable[[list[str], Path | None, Path, Path, Path], int]
 
@@ -240,6 +244,23 @@ class MovieFlowOrchestrator:
                 raise FlowManifestError(
                     "Only an ATTENTION_REQUIRED or RETRYABLE_FAILURE run can be cleared."
                 )
+            if self._is_batch_manifest(manifest) and self._cleanup_clear_continues(manifest):
+                item = self._current_item(manifest)
+                item["status"] = "ACQUIRED"
+                item["cleanup_acknowledgement"] = {
+                    "acknowledged_at": self._timestamp(),
+                    "reason": clean_reason,
+                }
+                manifest["clear_reason"] = clean_reason
+                item.pop("post_history_outcome", None)
+                manifest["attention"] = None
+                manifest["retryable_failure"] = None
+                manifest["state"] = STATE_RUNNING
+                manifest["result"] = "flow_running"
+                decision = self._advance_to_next_item(manifest)
+                if decision is not None:
+                    return decision
+                return self._continue(manifest, recover_interrupted=False)
             manifest.update(
                 {
                     "state": STATE_CLEARED,
@@ -257,6 +278,13 @@ class MovieFlowOrchestrator:
             return manifest, EXIT_OK
 
     def _continue(
+        self, manifest: JsonObject, *, recover_interrupted: bool = True
+    ) -> tuple[JsonObject, int]:
+        if self._is_batch_manifest(manifest):
+            return self._continue_batch(manifest, recover_interrupted=recover_interrupted)
+        return self._continue_legacy(manifest, recover_interrupted=recover_interrupted)
+
+    def _continue_legacy(
         self, manifest: JsonObject, *, recover_interrupted: bool = True
     ) -> tuple[JsonObject, int]:
         if recover_interrupted:
@@ -288,6 +316,43 @@ class MovieFlowOrchestrator:
             if decision is not None:
                 return decision
 
+    def _continue_batch(
+        self, manifest: JsonObject, *, recover_interrupted: bool = True
+    ) -> tuple[JsonObject, int]:
+        if recover_interrupted:
+            recovery = self._recover_interrupted_batch(manifest)
+            if recovery is not None:
+                return recovery
+
+        while True:
+            stage_key = self._stage_key(manifest)
+            stage = STAGE_BY_KEY[stage_key]
+            item = None if stage_key in SHARED_STAGE_KEYS else self._current_item(manifest)
+            input_path = self._batch_input_artifact(manifest, stage, item)
+            extra_args = ["--verbose"]
+            if stage.key == "probe" and item is not None:
+                extra_args.extend(["--recommendation-rank", str(item["recommendation_rank"])])
+            if stage.key == "download" and manifest.get("resume_stalled_authorized") is True:
+                extra_args.append("--resume-stalled")
+
+            payload, exit_code, output_valid = self._execute_stage(
+                manifest,
+                stage,
+                input_path=input_path,
+                extra_args=extra_args,
+                item=item,
+            )
+            decision = self._evaluate_batch_stage(
+                manifest,
+                stage,
+                payload,
+                exit_code=exit_code,
+                output_valid=output_valid,
+                item=item,
+            )
+            if decision is not None:
+                return decision
+
     def _execute_stage(
         self,
         manifest: JsonObject,
@@ -295,14 +360,18 @@ class MovieFlowOrchestrator:
         *,
         input_path: Path | None,
         extra_args: list[str],
+        item: JsonObject | None = None,
     ) -> tuple[JsonObject | None, int | None, bool]:
         run_directory = self._run_directory(manifest)
-        stage_record = self._stage_record(manifest, stage.key)
+        stage_record = self._stage_record_for(manifest, stage.key, item)
         attempts = stage_record.setdefault("attempts", [])
         if not isinstance(attempts, list):
             raise FlowManifestError(f"Stage {stage.key} has an invalid attempts list.")
         attempt_number = len(attempts) + 1
-        prefix = f"{stage.position:02d}-{stage.artifact_label}.attempt-{attempt_number:03d}"
+        item_label = f"item-{int(item['recommendation_rank']):02d}-" if item is not None else ""
+        prefix = (
+            f"{stage.position:02d}-{item_label}{stage.artifact_label}.attempt-{attempt_number:03d}"
+        )
         partial_path = run_directory / f"{prefix}.stdout.partial"
         artifact_path = run_directory / f"{prefix}.json"
         log_path = run_directory / f"{prefix}.stderr.log"
@@ -317,12 +386,21 @@ class MovieFlowOrchestrator:
         }
         attempts.append(attempt)
         stage_record["status"] = "RUNNING"
+        if item is not None:
+            item["status"] = "PROCESSING"
+            item["current_stage"] = stage.key
+            manifest["current_item_rank"] = item["recommendation_rank"]
+            self._aggregate_stage_record(manifest, stage.key)["status"] = "RUNNING"
         manifest.update(
             {
                 "state": STATE_RUNNING,
                 "result": "flow_running",
                 "current_stage": stage.key,
-                "message": f"Running movie-flow stage: {stage.key}.",
+                "message": (
+                    f"Running movie-flow item {item['recommendation_rank']} stage: {stage.key}."
+                    if item is not None
+                    else f"Running movie-flow stage: {stage.key}."
+                ),
                 "allowed_actions": ["status"],
             }
         )
@@ -557,6 +635,201 @@ class MovieFlowOrchestrator:
 
         raise FlowManifestError(f"No evaluator exists for stage {stage.key}.")
 
+    def _evaluate_batch_stage(
+        self,
+        manifest: JsonObject,
+        stage: StageSpec,
+        payload: JsonObject | None,
+        *,
+        exit_code: int | None,
+        output_valid: bool,
+        item: JsonObject | None,
+    ) -> tuple[JsonObject, int] | None:
+        result = payload.get("result") if payload else None
+        raw_error_code = payload.get("error_code") if payload else None
+        raw_message = payload.get("message") if payload else None
+        error_code = raw_error_code if isinstance(raw_error_code, str) else ""
+        message = raw_message if isinstance(raw_message, str) else ""
+
+        if not output_valid or exit_code is None:
+            return self._stage_failure(
+                manifest,
+                stage,
+                error_code=(
+                    "INVALID_STAGE_OUTPUT" if exit_code is not None else "CHILD_START_FAILED"
+                ),
+                message=message or "The stage did not produce a trustworthy result.",
+                attention=(
+                    exit_code is not None and stage.key in {"probe", "download", "transfer"}
+                ),
+                item=item,
+            )
+
+        if stage.key == "recommendations":
+            if exit_code == 0 and result == "recommendations_not_needed":
+                return self._finish(
+                    manifest,
+                    state=STATE_NO_ACTION,
+                    result="flow_no_action_needed",
+                    message="The movies directory does not currently need recommendations.",
+                )
+            if exit_code == 0 and result == "recommendations_created":
+                self._advance_shared_batch_stage(manifest, stage)
+                return None
+            return self._stage_failure(
+                manifest,
+                stage,
+                error_code=error_code or "RECOMMENDATION_STAGE_FAILED",
+                message=message or "The recommendation stage failed.",
+                attention=False,
+            )
+
+        if stage.key == "search":
+            if exit_code == 0 and result == "movie_search_completed" and payload is not None:
+                self._initialize_batch_items(manifest, payload)
+                self._aggregate_stage_record(manifest, "search")["status"] = "SUCCEEDED"
+                if not self._batch_items(manifest):
+                    return self._finish_batch(manifest)
+                first = self._batch_items(manifest)[0]
+                manifest["current_item_rank"] = first["recommendation_rank"]
+                manifest["current_stage"] = "probe"
+                manifest["message"] = "Movie search completed; recommendation 1 is next."
+                manifest["retryable_failure"] = None
+                manifest["attention"] = None
+                self._write_manifest(manifest)
+                return None
+            return self._stage_failure(
+                manifest,
+                stage,
+                error_code=error_code or "MOVIE_SEARCH_STAGE_FAILED",
+                message=message or "The movie-search stage failed.",
+                attention=False,
+            )
+
+        if item is None:
+            raise FlowManifestError(f"Batch stage {stage.key} has no current item.")
+
+        if stage.key == "probe":
+            if exit_code == 0 and result == "candidate_health_validated":
+                selected = payload.get("selected_candidate") if payload else None
+                if isinstance(selected, dict) and selected.get("status") == "READY_FOR_DOWNLOAD":
+                    self._advance_item_stage(manifest, item, stage)
+                    return None
+                return self._stage_failure(
+                    manifest,
+                    stage,
+                    error_code="INVALID_PROBE_SUCCESS",
+                    message="The probe result did not select a READY_FOR_DOWNLOAD candidate.",
+                    attention=True,
+                    item=item,
+                )
+            if exit_code in {3, 6} and result in {
+                "NO_PROBEABLE_CANDIDATES",
+                "NO_HEALTHY_TORRENT_FOUND",
+            }:
+                self._mark_item_skipped(
+                    manifest,
+                    item,
+                    error_code=error_code or str(result),
+                    message=message or "No usable torrent was available for this recommendation.",
+                )
+                return self._advance_to_next_item(manifest)
+            return self._stage_failure(
+                manifest,
+                stage,
+                error_code=error_code or "MOVIE_PROBE_STAGE_FAILED",
+                message=message or "The movie-probe stage failed.",
+                attention=exit_code not in {4, 5},
+                item=item,
+            )
+
+        if stage.key == "download":
+            if (
+                exit_code == 0
+                and result == "download_completed"
+                and payload is not None
+                and payload.get("status") == "READY_FOR_TRANSFER"
+            ):
+                self._advance_item_stage(manifest, item, stage)
+                return None
+            return self._stage_failure(
+                manifest,
+                stage,
+                error_code=error_code or "DOWNLOAD_STAGE_FAILED",
+                message=message or "The movie-download stage failed.",
+                attention=exit_code != 4,
+                item=item,
+            )
+
+        if stage.key == "transfer":
+            if exit_code == 0 and result == "transfer_completed":
+                item["post_history_outcome"] = {
+                    "type": "completed",
+                    "message": "The movie was transferred and seedbox cleanup completed.",
+                }
+                self._advance_item_stage(manifest, item, stage)
+                return None
+            transfer = payload.get("transfer") if payload else None
+            if (
+                result == "transfer_completed_cleanup_failed"
+                and isinstance(transfer, dict)
+                and transfer.get("status") == "COMPLETED"
+            ):
+                item["post_history_outcome"] = {
+                    "type": "cleanup_attention",
+                    "error_code": error_code or "SEEDBOX_CLEANUP_FAILED",
+                    "message": message or "The local copy completed but seedbox cleanup failed.",
+                }
+                self._advance_item_stage(manifest, item, stage, completed_status="PARTIAL_SUCCESS")
+                return None
+            return self._stage_failure(
+                manifest,
+                stage,
+                error_code=error_code or "TRANSFER_STAGE_FAILED",
+                message=message or "The movie-transfer stage failed.",
+                attention=True,
+                resume_allowed=True,
+                item=item,
+            )
+
+        if stage.key == "history":
+            if exit_code == 0 and result in {
+                "movie_history_recorded",
+                "movie_history_already_recorded",
+            }:
+                self._stage_record_for(manifest, "history", item)["status"] = "SUCCEEDED"
+                self._refresh_aggregate_item_stages(manifest)
+                outcome = item.get("post_history_outcome")
+                if isinstance(outcome, dict) and outcome.get("type") == "cleanup_attention":
+                    item["status"] = "ACQUIRED_CLEANUP_REQUIRED"
+                    return self._stage_failure(
+                        manifest,
+                        STAGE_BY_KEY["transfer"],
+                        error_code=str(outcome.get("error_code") or "SEEDBOX_CLEANUP_FAILED"),
+                        message=str(
+                            outcome.get("message")
+                            or "The local copy completed but seedbox cleanup failed."
+                        ),
+                        attention=True,
+                        resume_allowed=False,
+                        stage_status="PARTIAL_SUCCESS",
+                        item=item,
+                        clear_continues_batch=True,
+                    )
+                item["status"] = "ACQUIRED"
+                item.pop("post_history_outcome", None)
+                return self._advance_to_next_item(manifest)
+            return self._stage_failure(
+                manifest,
+                stage,
+                error_code=error_code or "MOVIE_HISTORY_STAGE_FAILED",
+                message=message or "The movie-history stage failed.",
+                attention=False,
+                item=item,
+            )
+
+        raise FlowManifestError(f"No batch evaluator exists for stage {stage.key}.")
+
     def _stage_failure(
         self,
         manifest: JsonObject,
@@ -567,9 +840,20 @@ class MovieFlowOrchestrator:
         attention: bool,
         resume_allowed: bool | None = None,
         stage_status: str = "FAILED",
+        item: JsonObject | None = None,
+        clear_continues_batch: bool = False,
     ) -> tuple[JsonObject, int]:
-        stage_record = self._stage_record(manifest, stage.key)
+        stage_record = self._stage_record_for(manifest, stage.key, item)
         stage_record["status"] = stage_status
+        if item is not None:
+            item["status"] = (
+                "ACQUIRED_CLEANUP_REQUIRED"
+                if clear_continues_batch
+                else ("ATTENTION_REQUIRED" if attention else "RETRYABLE_FAILURE")
+            )
+            item["current_stage"] = stage.key
+            aggregate = self._aggregate_stage_record(manifest, stage.key)
+            aggregate["status"] = stage_status
         if attention:
             allowed = (
                 resume_allowed
@@ -588,6 +872,12 @@ class MovieFlowOrchestrator:
                         "message": message,
                         "resume_allowed": allowed,
                         "guidance": self._attention_guidance(stage.key, error_code, allowed),
+                        **(
+                            {"recommendation_rank": item["recommendation_rank"]}
+                            if item is not None
+                            else {}
+                        ),
+                        **({"clear_continues_batch": True} if clear_continues_batch else {}),
                     },
                     "allowed_actions": (
                         ["status", "resume", "clear"] if allowed else ["status", "clear"]
@@ -607,12 +897,83 @@ class MovieFlowOrchestrator:
                     "stage": stage.key,
                     "error_code": error_code,
                     "message": message,
+                    **(
+                        {"recommendation_rank": item["recommendation_rank"]}
+                        if item is not None
+                        else {}
+                    ),
                 },
                 "allowed_actions": ["status", "run"],
             }
         )
         self._write_manifest(manifest)
         return manifest, EXIT_RETRYABLE
+
+    def _recover_interrupted_batch(self, manifest: JsonObject) -> tuple[JsonObject, int] | None:
+        if manifest.get("state") != STATE_RUNNING:
+            return None
+        stage_key = self._stage_key(manifest)
+        stage = STAGE_BY_KEY[stage_key]
+        item = None if stage_key in SHARED_STAGE_KEYS else self._current_item(manifest)
+        stage_record = self._stage_record_for(manifest, stage_key, item)
+        attempts = stage_record.get("attempts")
+        if not isinstance(attempts, list) or not attempts:
+            return None
+        latest_attempt = attempts[-1]
+        if not isinstance(latest_attempt, dict):
+            return None
+        attempt_status = latest_attempt.get("status")
+        if attempt_status == "COMPLETED":
+            raw_artifact = latest_attempt.get("artifact")
+            exit_code = latest_attempt.get("exit_code")
+            if isinstance(raw_artifact, str) and isinstance(exit_code, int):
+                payload = self._read_stage_artifact(manifest, Path(raw_artifact))
+                return self._evaluate_batch_stage(
+                    manifest,
+                    stage,
+                    payload,
+                    exit_code=exit_code,
+                    output_valid=True,
+                    item=item,
+                )
+        if attempt_status == "LAUNCH_FAILED":
+            return self._stage_failure(
+                manifest,
+                stage,
+                error_code="CHILD_START_FAILED",
+                message="The child stage could not be started.",
+                attention=False,
+                item=item,
+            )
+        if attempt_status == "INVALID_OUTPUT":
+            return self._stage_failure(
+                manifest,
+                stage,
+                error_code="INVALID_STAGE_OUTPUT",
+                message="The child stage did not produce a trustworthy result.",
+                attention=stage_key in {"probe", "download", "transfer"},
+                item=item,
+            )
+        if attempt_status != "RUNNING":
+            return None
+        latest_attempt["status"] = "INTERRUPTED"
+        latest_attempt["interrupted_at"] = self._timestamp()
+        if stage_key in SAFE_INTERRUPTED_STAGES:
+            stage_record["status"] = "INTERRUPTED_RETRYABLE"
+            if item is not None:
+                item["status"] = "PROCESSING"
+            manifest["message"] = f"Recovering interrupted {stage_key} stage."
+            self._write_manifest(manifest)
+            return None
+        return self._stage_failure(
+            manifest,
+            stage,
+            error_code="INTERRUPTED_STAGE",
+            message=f"The {stage_key} stage was interrupted while external state may have changed.",
+            attention=True,
+            resume_allowed=stage_key == "transfer",
+            item=item,
+        )
 
     def _recover_interrupted(self, manifest: JsonObject) -> tuple[JsonObject, int] | None:
         if manifest.get("state") != STATE_RUNNING:
@@ -674,6 +1035,221 @@ class MovieFlowOrchestrator:
             attention=True,
             resume_allowed=stage_key == "transfer",
         )
+
+    def _initialize_batch_items(self, manifest: JsonObject, search_payload: JsonObject) -> None:
+        movies = search_payload.get("movies")
+        if not isinstance(movies, list):
+            raise FlowManifestError("Movie-search output has no valid movies array.")
+        items: list[JsonObject] = []
+        for rank, movie in enumerate(movies, start=1):
+            if not isinstance(movie, dict):
+                raise FlowManifestError(f"Movie-search recommendation {rank} is invalid.")
+            recommendation = movie.get("recommendation")
+            if not isinstance(recommendation, dict):
+                raise FlowManifestError(
+                    f"Movie-search recommendation {rank} has no valid identity."
+                )
+            tmdb_id = recommendation.get("tmdb_id")
+            title = recommendation.get("title")
+            year = recommendation.get("year")
+            if (
+                not isinstance(tmdb_id, int)
+                or isinstance(tmdb_id, bool)
+                or tmdb_id <= 0
+                or not isinstance(title, str)
+                or not title.strip()
+                or not isinstance(year, int)
+                or isinstance(year, bool)
+            ):
+                raise FlowManifestError(f"Movie-search recommendation {rank} is incomplete.")
+            items.append(
+                {
+                    "recommendation_rank": rank,
+                    "recommendation": {
+                        "tmdb_id": tmdb_id,
+                        "title": title.strip(),
+                        "year": year,
+                    },
+                    "status": "PENDING",
+                    "current_stage": "probe",
+                    "stages": {
+                        key: {
+                            "position": STAGE_BY_KEY[key].position,
+                            "status": "PENDING",
+                            "attempts": [],
+                        }
+                        for key in ("probe", "download", "transfer", "history")
+                    },
+                }
+            )
+        manifest["items"] = items
+        self._refresh_batch_summary(manifest)
+
+    def _advance_shared_batch_stage(self, manifest: JsonObject, completed: StageSpec) -> None:
+        self._aggregate_stage_record(manifest, completed.key)["status"] = "SUCCEEDED"
+        next_stage = STAGES[completed.position]
+        manifest.update(
+            {
+                "state": STATE_RUNNING,
+                "result": "flow_running",
+                "current_stage": next_stage.key,
+                "message": f"Stage {completed.key} completed; {next_stage.key} is next.",
+                "retryable_failure": None,
+                "attention": None,
+                "allowed_actions": ["status"],
+            }
+        )
+        self._write_manifest(manifest)
+
+    def _advance_item_stage(
+        self,
+        manifest: JsonObject,
+        item: JsonObject,
+        completed: StageSpec,
+        *,
+        completed_status: str = "SUCCEEDED",
+    ) -> None:
+        self._stage_record_for(manifest, completed.key, item)["status"] = completed_status
+        if completed.key == "download":
+            manifest.pop("resume_stalled_authorized", None)
+        item_keys = ("probe", "download", "transfer", "history")
+        next_key = item_keys[item_keys.index(completed.key) + 1]
+        item["current_stage"] = next_key
+        item["status"] = "PROCESSING"
+        manifest.update(
+            {
+                "state": STATE_RUNNING,
+                "result": "flow_running",
+                "current_stage": next_key,
+                "current_item_rank": item["recommendation_rank"],
+                "message": (
+                    f"Recommendation {item['recommendation_rank']} stage {completed.key} "
+                    f"completed; {next_key} is next."
+                ),
+                "retryable_failure": None,
+                "attention": None,
+                "allowed_actions": ["status"],
+            }
+        )
+        self._write_manifest(manifest)
+
+    def _mark_item_skipped(
+        self,
+        manifest: JsonObject,
+        item: JsonObject,
+        *,
+        error_code: str,
+        message: str,
+    ) -> None:
+        item["status"] = "SKIPPED"
+        item["skip"] = {"error_code": error_code, "message": message}
+        item["current_stage"] = None
+        self._stage_record_for(manifest, "probe", item)["status"] = "NO_RESULT"
+        for key in ("download", "transfer", "history"):
+            self._stage_record_for(manifest, key, item)["status"] = "SKIPPED"
+
+    def _advance_to_next_item(self, manifest: JsonObject) -> tuple[JsonObject, int] | None:
+        items = self._batch_items(manifest)
+        current_rank = manifest.get("current_item_rank")
+        current_index = next(
+            (
+                index
+                for index, value in enumerate(items)
+                if value.get("recommendation_rank") == current_rank
+            ),
+            -1,
+        )
+        if current_index >= 0 and current_index + 1 < len(items):
+            next_item = items[current_index + 1]
+            manifest.update(
+                {
+                    "state": STATE_RUNNING,
+                    "result": "flow_running",
+                    "current_item_rank": next_item["recommendation_rank"],
+                    "current_stage": "probe",
+                    "message": (
+                        f"Recommendation {current_rank} finished; recommendation "
+                        f"{next_item['recommendation_rank']} is next."
+                    ),
+                    "retryable_failure": None,
+                    "attention": None,
+                    "allowed_actions": ["status"],
+                }
+            )
+            self._refresh_batch_summary(manifest)
+            self._write_manifest(manifest)
+            return None
+        manifest["current_item_rank"] = None
+        self._refresh_batch_summary(manifest)
+        return self._finish_batch(manifest)
+
+    def _finish_batch(self, manifest: JsonObject) -> tuple[JsonObject, int]:
+        summary = self._refresh_batch_summary(manifest)
+        acquired = int(summary["acquired_count"])
+        skipped = int(summary["skipped_count"])
+        missing = int(summary["missing_recommendation_count"])
+        if acquired == 0:
+            state = STATE_NO_ACQUISITION
+            result = "flow_no_acquisition_available"
+            message = "No recommendation in the batch could be acquired."
+        elif acquired == BATCH_TARGET_COUNT and skipped == 0 and missing == 0:
+            state = STATE_COMPLETED
+            result = "flow_completed"
+            message = "All three recommended movies were transferred and recorded."
+        else:
+            state = STATE_COMPLETED
+            result = "flow_completed_with_skips"
+            message = (
+                f"The batch acquired {acquired} movie(s); {skipped + missing} were unavailable."
+            )
+        manifest.update(
+            {
+                "state": state,
+                "result": result,
+                "current_stage": "history",
+                "current_item_rank": None,
+                "completed_at": self._timestamp(),
+                "message": message,
+                "attention": None,
+                "retryable_failure": None,
+                "allowed_actions": ["status"],
+            }
+        )
+        self._refresh_aggregate_item_stages(manifest)
+        self._write_manifest(manifest)
+        return manifest, EXIT_OK
+
+    def _refresh_batch_summary(self, manifest: JsonObject) -> JsonObject:
+        items = self._batch_items(manifest)
+        acquired = sum(1 for item in items if item.get("status") == "ACQUIRED")
+        skipped = sum(1 for item in items if item.get("status") == "SKIPPED")
+        summary: JsonObject = {
+            "target_count": BATCH_TARGET_COUNT,
+            "requested_count": len(items),
+            "acquired_count": acquired,
+            "skipped_count": skipped,
+            "missing_recommendation_count": max(0, BATCH_TARGET_COUNT - len(items)),
+        }
+        self._batch(manifest)["summary"] = summary
+        manifest["summary"] = dict(summary)
+        manifest["missing_recommendation_slots"] = list(
+            range(len(items) + 1, BATCH_TARGET_COUNT + 1)
+        )
+        return summary
+
+    def _refresh_aggregate_item_stages(self, manifest: JsonObject) -> None:
+        items = self._batch_items(manifest)
+        for key in ITEM_STAGE_KEYS:
+            statuses = [self._stage_record_for(manifest, key, item).get("status") for item in items]
+            aggregate = self._aggregate_stage_record(manifest, key)
+            if any(status in {"FAILED", "INTERRUPTED_RETRYABLE"} for status in statuses):
+                aggregate["status"] = "FAILED"
+            elif statuses and all(status == "SUCCEEDED" for status in statuses):
+                aggregate["status"] = "SUCCEEDED"
+            elif any(status in {"SUCCEEDED", "PARTIAL_SUCCESS"} for status in statuses):
+                aggregate["status"] = "PARTIAL_SUCCESS"
+            elif statuses and all(status in {"NO_RESULT", "SKIPPED"} for status in statuses):
+                aggregate["status"] = "NO_RESULT"
 
     def _advance(
         self, manifest: JsonObject, completed: StageSpec, *, completed_status: str = "SUCCEEDED"
@@ -737,6 +1313,26 @@ class MovieFlowOrchestrator:
             "attention": None,
             "retryable_failure": None,
             "allowed_actions": ["status"],
+            "current_item_rank": None,
+            "items": [],
+            "summary": {
+                "target_count": BATCH_TARGET_COUNT,
+                "requested_count": 0,
+                "acquired_count": 0,
+                "skipped_count": 0,
+                "missing_recommendation_count": BATCH_TARGET_COUNT,
+            },
+            "missing_recommendation_slots": [1, 2, 3],
+            "batch": {
+                "target_count": BATCH_TARGET_COUNT,
+                "summary": {
+                    "target_count": BATCH_TARGET_COUNT,
+                    "requested_count": 0,
+                    "acquired_count": 0,
+                    "skipped_count": 0,
+                    "missing_recommendation_count": BATCH_TARGET_COUNT,
+                },
+            },
         }
         self._write_manifest(manifest)
         return manifest
@@ -754,6 +1350,31 @@ class MovieFlowOrchestrator:
         path = Path(raw_path)
         return self._validated_artifact_path(manifest, path)
 
+    def _batch_input_artifact(
+        self, manifest: JsonObject, stage: StageSpec, item: JsonObject | None
+    ) -> Path | None:
+        if stage.key == "recommendations":
+            return None
+        if stage.key == "search":
+            record = self._aggregate_stage_record(manifest, "recommendations")
+        elif stage.key == "probe":
+            record = self._aggregate_stage_record(manifest, "search")
+        else:
+            if item is None:
+                raise FlowManifestError(f"Batch stage {stage.key} has no current item.")
+            previous = {
+                "download": "probe",
+                "transfer": "download",
+                "history": "transfer",
+            }[stage.key]
+            record = self._stage_record_for(manifest, previous, item)
+        raw_path = record.get("latest_artifact")
+        if not isinstance(raw_path, str) or not raw_path:
+            raise FlowManifestError(
+                f"Stage {stage.key} cannot start because its input artifact is missing."
+            )
+        return self._validated_artifact_path(manifest, Path(raw_path))
+
     def _stage_record(self, manifest: JsonObject, stage_key: str) -> JsonObject:
         stages = manifest.get("stages")
         if not isinstance(stages, dict):
@@ -762,6 +1383,50 @@ class MovieFlowOrchestrator:
         if not isinstance(record, dict):
             raise FlowManifestError(f"The flow manifest has no valid {stage_key} stage.")
         return record
+
+    def _aggregate_stage_record(self, manifest: JsonObject, stage_key: str) -> JsonObject:
+        return self._stage_record(manifest, stage_key)
+
+    def _stage_record_for(
+        self, manifest: JsonObject, stage_key: str, item: JsonObject | None
+    ) -> JsonObject:
+        if item is None or not self._is_batch_manifest(manifest) or stage_key in SHARED_STAGE_KEYS:
+            return self._stage_record(manifest, stage_key)
+        stages = item.get("stages")
+        if not isinstance(stages, dict):
+            raise FlowManifestError("The current batch item has no valid stages object.")
+        record = stages.get(stage_key)
+        if not isinstance(record, dict):
+            raise FlowManifestError(f"The current batch item has no valid {stage_key} stage.")
+        return record
+
+    def _is_batch_manifest(self, manifest: JsonObject) -> bool:
+        return manifest.get("schema_version") == FLOW_SCHEMA_VERSION
+
+    def _batch(self, manifest: JsonObject) -> JsonObject:
+        batch = manifest.get("batch")
+        if not isinstance(batch, dict):
+            raise FlowManifestError("The batch flow manifest has no valid batch object.")
+        return batch
+
+    def _batch_items(self, manifest: JsonObject) -> list[JsonObject]:
+        items = manifest.get("items")
+        if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+            raise FlowManifestError("The batch flow manifest has no valid items array.")
+        return items  # type: ignore[return-value]
+
+    def _current_item(self, manifest: JsonObject) -> JsonObject:
+        rank = manifest.get("current_item_rank")
+        if not isinstance(rank, int) or isinstance(rank, bool) or rank <= 0:
+            raise FlowManifestError("The batch flow manifest has no current item.")
+        for item in self._batch_items(manifest):
+            if item.get("recommendation_rank") == rank:
+                return item
+        raise FlowManifestError("The batch flow manifest current item does not exist.")
+
+    def _cleanup_clear_continues(self, manifest: JsonObject) -> bool:
+        attention = manifest.get("attention")
+        return isinstance(attention, dict) and attention.get("clear_continues_batch") is True
 
     def _stage_key(self, manifest: JsonObject) -> str:
         value = manifest.get("current_stage")
@@ -785,7 +1450,7 @@ class MovieFlowOrchestrator:
         error_code = self._latest_error_code(manifest)
         if stage == "probe":
             return "An interrupted or unclean probe must be inspected and cleared manually."
-        if error_code == "SEEDBOX_CLEANUP_FAILED":
+        if error_code == "SEEDBOX_CLEANUP_FAILED" or self._cleanup_clear_continues(manifest):
             return (
                 "A completed transfer with failed cleanup cannot be retransferred; "
                 "clean up and clear it."
@@ -838,7 +1503,10 @@ class MovieFlowOrchestrator:
             raise FlowManifestError(f"Movie-flow manifest was not found: {path}") from exc
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise FlowManifestError(f"Movie-flow manifest is not readable JSON: {path}") from exc
-        if not isinstance(decoded, dict) or decoded.get("schema_version") != FLOW_SCHEMA_VERSION:
+        if not isinstance(decoded, dict) or decoded.get("schema_version") not in {
+            LEGACY_FLOW_SCHEMA_VERSION,
+            FLOW_SCHEMA_VERSION,
+        }:
             raise FlowManifestError(f"Movie-flow manifest has an unsupported schema: {path}")
         run_id = decoded.get("run_id")
         if not isinstance(run_id, str) or not _valid_run_id(run_id):

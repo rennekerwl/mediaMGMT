@@ -98,7 +98,8 @@ GOOGLE_SERVICE_ACCOUNT_JSON={"type":"service_account",...}
 numbers: 1 means hated it, 2 disliked it, 3 neutral, 4 liked it, and 5 loved it.
 Ratings 4 and 5 seed recommendations. A blank rating with a valid TMDb ID means the
 movie was acquired but has not been rated, so it is excluded without influencing
-recommendations. Every recorded TMDb ID is excluded. A rating of 5 contributes 1.5
+recommendations. Every recorded TMDb ID is excluded. In the legacy engine,
+a rating of 5 contributes 1.5
 times the recommendation weight of a rating of 4.
 
 Run one check with either installed entry point:
@@ -119,11 +120,56 @@ contains `tmdb_id`, `title`, and `year` for each recommendation. When recommenda
 are not needed, it emits `recommendations_not_needed` with an empty list. Logs and
 errors remain on standard error so the JSON can be piped directly to the next stage.
 
-The first result is the strongest rating-weighted personalized match. The second
+In the legacy engine, the first result is the strongest rating-weighted personalized match. The second
 prefers a strong personalized match sharing at most one TMDb genre with the first.
 The final line is always an exploration result chosen for low genre overlap from
 released TMDb discoveries with a rating of at least 7.0 and at least 500 votes. If
 the personalized pool is thin, discovery results fill the earlier positions as well.
+
+### Preview and use taste-aware recommendations
+
+The new `llm` engine collects page one of TMDb recommendations for each distinct
+movie rated 4 or 5, plus up to three discovery pages using the quality thresholds
+above. Each eligible movie appears once in the model input; repeated recommendations
+do not add points. The model selects up to three movies using the full rating history,
+including dislikes, neutral ratings, and Notes. Rated-movie synopses and genres provide
+context when available. There are no genre quotas or reserved discovery slots.
+
+Configure an OpenRouter key and an explicit model ID in `.env`:
+
+```dotenv
+RECOMMENDATION_ENGINE=llm
+OPENROUTER_API_KEY=your_openrouter_api_key
+OPENROUTER_MODEL=your_chosen_model_id
+```
+
+Choose a model/provider supporting structured outputs. The request sends movie ratings,
+Notes, and TMDb metadata to OpenRouter and its serving provider. The full candidate pool
+and taste history are sent without silent truncation.
+
+```powershell
+media-recommend --preview
+# Or, from this checkout:
+.venv\Scripts\python.exe -m media_scope.recommend_cli --preview
+```
+
+Preview always exercises the new engine, regardless of folder count or the configured
+engine. It prints picks, reasons, model, candidate count, and selection method as JSON.
+It does not write the production recommendation file or start acquisition, and does
+not require movie/output directories. Review whether you want to watch the picks before
+reading their explanations. A preview marked as fallback does not validate model quality.
+
+The automatic flow uses the `llm` engine by default. After reviewing a live preview, leave
+`RECOMMENDATION_ENGINE` unset or set it to `llm` to use taste-aware selection. Set it to
+`legacy` for an explicit rollback. The production three-movie target, folder threshold, text
+file, and JSON handoff stay the same.
+
+Missing OpenRouter key/model is a configuration error. Runtime API failures or invalid
+selections use a deterministic fallback and emit a warning. Fallback takes turns through
+the liked-seed lists (highest rating first, then TMDb ID), followed by discovery, skipping
+already selected movies. It applies neither duplicate-support scoring nor genre quotas.
+OpenRouter requests have a 60-second timeout and at most one retry for transient failures.
+An oversized context also falls back rather than silently dropping candidates or ratings.
 
 For Windows Task Scheduler, use `.venv\Scripts\python.exe` as the program,
 `-m media_scope.recommend_cli` as the arguments, and this repository as the
@@ -203,6 +249,10 @@ desktop:
 media-recommend | python -m media_scope.movie_search | python -m media_scope.movie_probe
 ```
 
+The standalone command keeps its original single-movie behavior. To probe only one
+specific entry from the recommendation list, pass `--recommendation-rank 1`, `2`, or
+`3`. The checkpointed flow uses this option internally for its three-movie batch.
+
 To continue directly into the full-download stage, add the existing downloader to
 the pipeline:
 
@@ -218,9 +268,11 @@ media-recommend | python -m media_scope.movie_search | python -m media_scope.mov
 
 ## Checkpointed movie-flow orchestration
 
-`media-movie-flow` runs the same movie stages through their existing JSON standard
-input/output contracts, while saving every handoff and stderr log. Only one flow is
-active at a time. By default its state is stored under
+`media-movie-flow` runs recommendation and search once, then processes every returned
+recommendation in order. Each movie completes probe, download, transfer, and history
+before the next movie begins. The existing single-movie JSON contracts remain intact,
+and every item handoff and stderr log is saved. Only one flow is active at a time. By
+default its state is stored under
 `RECOMMENDATIONS_DIRECTORY\movie-flow`; set `MOVIE_FLOW_DIRECTORY` to use another
 local directory.
 
@@ -236,6 +288,11 @@ Each run has a unique directory beneath `runs`, plus a versioned `manifest.json`
 never automatically deleted. A second `run` exits successfully with
 `flow_already_running` when another process owns the flow lock.
 
+New manifests use schema version 2 and expose the current recommendation rank, an
+ordered `items` array with per-stage attempts, and requested/acquired/skipped/missing
+counts. Schema-version-1 runs remain readable and resumable through the original
+single-movie state machine.
+
 Recommendation and search failures that are safe to repeat remain retryable. An
 interrupted download is restarted from its saved probe handoff and uses Step 6's
 existing deterministic job identity. A verified transfer advances to an idempotent
@@ -243,6 +300,12 @@ Google Sheets history stage. If that write fails, later runs retry only history 
 never repeat the transfer. An interrupted probe or transfer, a stalled or unsafe
 download, and transfer failures stop as `ATTENTION_REQUIRED` because external state
 may need inspection.
+
+If one recommendation has no probeable or healthy torrent, that item is marked
+`SKIPPED` and the next recommendation proceeds. The final result is `flow_completed`
+when all three are acquired, `flow_completed_with_skips` when at least one succeeds,
+or `flow_no_acquisition_available` when none succeeds. If TMDb returns fewer than
+three recommendations, the missing slots are reported without generating replacements.
 
 After correcting a resumable download or transfer problem, use the run ID reported by
 `status`:
@@ -265,7 +328,9 @@ media-movie-flow clear `
 state. It never removes torrents, local or remote files, or run history. A
 `transfer_completed_cleanup_failed` result is recorded in Sheets before cleanup
 attention is returned and cannot be resumed; complete its reported seedbox cleanup
-manually and then clear the run.
+manually and then clear the run. In a schema-version-2 batch, that acknowledgement
+marks the transferred item complete and continues with the next recommendation without
+retransferring it.
 
 The orchestrator uses these process exit codes:
 
@@ -320,6 +385,10 @@ same-origin Jackett download URL. Private or unresolvable results are skipped. A
 `RTORRENT_PROBE_MAX_CANDIDATES` resolved torrents are submitted to the remote rTorrent
 instance; the first torrent whose metadata arrives is stopped, retained, and returned
 as `READY_FOR_DOWNLOAD`. Failed probes are erased.
+
+When `--recommendation-rank N` is supplied, only that movie's ranked torrent results
+are considered. Without the option, the validator retains its original behavior of
+considering the complete recommendation list and returning one healthy torrent.
 
 The script uses the existing `RTORRENT_RPC_*`, `RTORRENT_PROBE_*`, `JACKETT_*`, and
 `SEEDBOX_SSH_*` settings from `.env`. Probe directories are remote POSIX paths managed

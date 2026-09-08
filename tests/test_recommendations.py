@@ -95,8 +95,8 @@ def test_parse_ratings_accepts_case_insensitive_headers_and_optional_year() -> N
     csv_text = " title , YEAR , rating ,Notes\nArrival,2016,4,great\nAlien,,3,okay\n"
 
     assert parse_ratings_csv(csv_text, warnings.append) == [
-        RatingRow("Arrival", 2016, 4, 2),
-        RatingRow("Alien", None, 3, 3),
+        RatingRow("Arrival", 2016, 4, 2, notes="great"),
+        RatingRow("Alien", None, 3, 3, notes="okay"),
     ]
     assert warnings == []
 
@@ -142,7 +142,7 @@ def test_parse_movie_sheet_keeps_blank_rating_as_acquired_only() -> None:
         warnings.append,
     )
 
-    assert parsed.ratings == [RatingRow("Arrival", 2016, 5, 2, 329865)]
+    assert parsed.ratings == [RatingRow("Arrival", 2016, 5, 2, 329865, "great")]
     assert parsed.acquired_ids == frozenset({329865, 118340})
     assert warnings == []
 

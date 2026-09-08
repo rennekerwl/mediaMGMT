@@ -36,6 +36,27 @@ def movie_report(*results: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def multi_movie_report() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "result": "movie_search_completed",
+        "movies": [
+            {
+                "recommendation": {"tmdb_id": 1091, "title": "The Thing", "year": 1982},
+                "results": [result(2, HASH_B), result(1, HASH_A)],
+            },
+            {
+                "recommendation": {"tmdb_id": 238, "title": "The Godfather", "year": 1972},
+                "results": [result(3, HASH_A), result(1, HASH_B), result(2, HASH_A)],
+            },
+            {
+                "recommendation": {"tmdb_id": 680, "title": "Pulp Fiction", "year": 1994},
+                "results": [result(1, HASH_B)],
+            },
+        ],
+    }
+
+
 def result(
     rank: int,
     infohash: str | None = HASH_A,
@@ -70,6 +91,40 @@ def test_parse_movie_search_sorts_results_and_rejects_bad_handoffs() -> None:
     for value in ({}, {"schema_version": 1, "result": "error", "movies": []}):
         with pytest.raises(MovieProbeInputError):
             parse_movie_search(value)
+
+
+def test_parse_movie_search_selects_only_requested_recommendation_in_torrent_order() -> None:
+    values = parse_movie_search(multi_movie_report(), recommendation_rank=2)
+
+    assert [(value.recommendation_rank, value.jackett_rank) for value in values] == [
+        (2, 1),
+        (2, 2),
+        (2, 3),
+    ]
+    assert [value.search_order for value in values] == [1, 2, 3]
+    assert {value.tmdb_id for value in values} == {238}
+
+
+def test_parse_movie_search_rejects_missing_requested_recommendation() -> None:
+    with pytest.raises(MovieProbeInputError, match="Recommendation rank 4 does not exist"):
+        parse_movie_search(multi_movie_report(), recommendation_rank=4)
+
+    with pytest.raises(MovieProbeInputError, match="positive integer"):
+        parse_movie_search(multi_movie_report(), recommendation_rank=0)
+
+
+def test_parse_movie_search_without_rank_preserves_all_groups_and_order() -> None:
+    values = parse_movie_search(multi_movie_report())
+
+    assert [(value.recommendation_rank, value.jackett_rank) for value in values] == [
+        (1, 1),
+        (1, 2),
+        (2, 1),
+        (2, 2),
+        (2, 3),
+        (3, 1),
+    ]
+    assert [value.search_order for value in values] == list(range(1, 7))
 
 
 def test_resolution_uses_hash_fallback_and_does_not_count_failures() -> None:
@@ -166,3 +221,36 @@ def test_cli_selects_one_torrent_and_mirrors_exact_json(
     assert handoff.candidate.infohash == HASH_A
     assert "secret" not in captured.out + captured.err + mirrored
     assert HASH_A.upper() in rtorrent.existing
+
+
+def test_cli_recommendation_rank_selects_only_that_movie(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("RECOMMENDATIONS_DIRECTORY", str(tmp_path))
+    monkeypatch.setenv("JACKETT_URL", "http://jackett.test")
+    monkeypatch.setenv("JACKETT_API_KEY", "secret")
+    monkeypatch.setenv("RTORRENT_PROBE_DIRECTORY", "/srv/probes")
+    monkeypatch.setenv("RTORRENT_PROBE_MAX_CANDIDATES", "10")
+    monkeypatch.setenv("RTORRENT_PREFLIGHT_MAGNET", "")
+    monkeypatch.setattr("media_scope.movie_probe.load_dotenv", lambda: False)
+    rtorrent = ContextRtorrent({HASH_B: [metadata(True, 3, 1)]})
+
+    code = main(
+        ["--recommendation-rank", "2"],
+        input_text=json.dumps(multi_movie_report()),
+        rtorrent_client_factory=lambda *_args, **_kwargs: rtorrent,
+        filesystem_factory=lambda *_args, **_kwargs: FakeRemoteFilesystem(),
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert payload["scope"] == {
+        "media_type": "movie",
+        "tmdb_id": 238,
+        "title": "The Godfather",
+        "year": 1972,
+        "recommendation_rank": 2,
+    }
+    assert payload["selected_candidate"]["original_rank"] == 1
