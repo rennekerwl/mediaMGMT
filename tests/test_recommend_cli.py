@@ -8,9 +8,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 
 from media_scope.movie_search import MovieSearchInputError, load_recommendations
+from media_scope.openrouter_client import OpenRouterClient
 from media_scope.recommend_cli import main
 from media_scope.recommendations import Recommendation, RecommendationInputError
 
@@ -86,7 +88,7 @@ def configure(
     monkeypatch.setenv("MOVIES_DIRECTORY", str(movies))
     monkeypatch.setenv("RECOMMENDATIONS_DIRECTORY", str(recommendations or movies))
     monkeypatch.setenv("TMDB_BEARER_TOKEN", "test-token")
-    monkeypatch.delenv("RECOMMENDATION_ENGINE", raising=False)
+    monkeypatch.setenv("RECOMMENDATION_ENGINE", "legacy")
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_MODEL", raising=False)
     monkeypatch.setattr("media_scope.recommend_cli.load_dotenv", lambda: False)
@@ -404,7 +406,7 @@ def test_llm_engine_preserves_production_handoff_and_logs_reasons(
     assert "configured-key" not in captured.err
 
 
-def test_legacy_engine_is_default_and_does_not_create_selector(
+def test_legacy_engine_is_an_explicit_rollback_and_does_not_create_selector(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -425,6 +427,65 @@ def test_legacy_engine_is_default_and_does_not_create_selector(
 
     assert exit_code == 0
     assert (tmp_path / "RECOMMENDATIONS.txt").exists()
+
+
+def test_unset_engine_uses_llm_selector_with_configured_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    configure(monkeypatch, tmp_path)
+    monkeypatch.delenv("RECOMMENDATION_ENGINE", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "configured-key")
+    monkeypatch.setenv("OPENROUTER_MODEL", "configured-model")
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == OpenRouterClient.BASE_URL
+        assert request.headers["Authorization"] == "Bearer configured-key"
+        body = json.loads(request.content)
+        requests.append(body)
+        user_content = body["messages"][1]["content"]
+        context = json.loads(user_content.split("\n\n", 1)[1])
+        selected = [
+            {"tmdb_id": item["tmdb_id"], "reason": f"Mocked reason {item['tmdb_id']}"}
+            for item in context["candidates"]
+        ]
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps({"recommendations": selected})}}]},
+        )
+
+    def selector_factory(api_key: str, model: str) -> OpenRouterClient:
+        assert api_key == "configured-key"
+        assert model == "configured-model"
+        return OpenRouterClient(
+            api_key,
+            model,
+            transport=httpx.MockTransport(handler),
+            sleep=lambda _delay: None,
+        )
+
+    exit_code = main(
+        [],
+        client_factory=CliRecommendationClient,
+        sheet_client_factory=FakeSheetClient,
+        selector_client_factory=selector_factory,
+        today=date(2030, 1, 1),
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert len(requests) == 1
+    assert payload == {
+        "schema_version": 1,
+        "result": "recommendations_created",
+        "recommendations": [
+            {"tmdb_id": 10, "title": "First", "year": 2020},
+            {"tmdb_id": 11, "title": "Second", "year": 2020},
+            {"tmdb_id": 12, "title": "Explore", "year": 2020},
+        ],
+    }
 
 
 def test_full_folder_skips_llm_credentials_and_all_clients(

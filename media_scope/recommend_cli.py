@@ -236,7 +236,7 @@ def _recommendation_engine(
     preview: bool,
 ) -> tuple[str | None, tuple[str, str] | None]:
     """Resolve the configured engine, validating LLM credentials for preview."""
-    configured = os.getenv("RECOMMENDATION_ENGINE", "legacy").strip().casefold()
+    configured = os.getenv("RECOMMENDATION_ENGINE", "llm").strip().casefold()
     if preview:
         configured = "llm"
     if configured not in {"legacy", "llm"}:

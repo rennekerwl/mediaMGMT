@@ -98,7 +98,7 @@ GOOGLE_SERVICE_ACCOUNT_JSON={"type":"service_account",...}
 numbers: 1 means hated it, 2 disliked it, 3 neutral, 4 liked it, and 5 loved it.
 Ratings 4 and 5 seed recommendations. A blank rating with a valid TMDb ID means the
 movie was acquired but has not been rated, so it is excluded without influencing
-recommendations. Every recorded TMDb ID is excluded. In the default legacy engine,
+recommendations. Every recorded TMDb ID is excluded. In the legacy engine,
 a rating of 5 contributes 1.5
 times the recommendation weight of a rating of 4.
 
@@ -126,7 +126,7 @@ The final line is always an exploration result chosen for low genre overlap from
 released TMDb discoveries with a rating of at least 7.0 and at least 500 votes. If
 the personalized pool is thin, discovery results fill the earlier positions as well.
 
-### Preview and activate taste-aware recommendations
+### Preview and use taste-aware recommendations
 
 The new `llm` engine collects page one of TMDb recommendations for each distinct
 movie rated 4 or 5, plus up to three discovery pages using the quality thresholds
@@ -138,7 +138,7 @@ context when available. There are no genre quotas or reserved discovery slots.
 Configure an OpenRouter key and an explicit model ID in `.env`:
 
 ```dotenv
-RECOMMENDATION_ENGINE=legacy
+RECOMMENDATION_ENGINE=llm
 OPENROUTER_API_KEY=your_openrouter_api_key
 OPENROUTER_MODEL=your_chosen_model_id
 ```
@@ -159,9 +159,10 @@ It does not write the production recommendation file or start acquisition, and d
 not require movie/output directories. Review whether you want to watch the picks before
 reading their explanations. A preview marked as fallback does not validate model quality.
 
-After reviewing a live preview, set `RECOMMENDATION_ENGINE=llm` to activate the new
-selection in the existing automatic flow. Set it back to `legacy` to roll back. The
-production three-movie target, folder threshold, text file, and JSON handoff stay the same.
+The automatic flow uses the `llm` engine by default. After reviewing a live preview, leave
+`RECOMMENDATION_ENGINE` unset or set it to `llm` to use taste-aware selection. Set it to
+`legacy` for an explicit rollback. The production three-movie target, folder threshold, text
+file, and JSON handoff stay the same.
 
 Missing OpenRouter key/model is a configuration error. Runtime API failures or invalid
 selections use a deterministic fallback and emit a warning. Fallback takes turns through
