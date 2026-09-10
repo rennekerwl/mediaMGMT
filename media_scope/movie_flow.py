@@ -1654,6 +1654,7 @@ def run_process(
             stdout=stdout,
             stderr=stderr,
             check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
     return completed.returncode
 

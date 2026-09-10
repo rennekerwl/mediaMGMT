@@ -31,6 +31,7 @@ def test_scheduler_installer_dry_run_has_safe_defaults() -> None:
         text=True,
         check=False,
         timeout=30,
+        creationflags=subprocess.CREATE_NO_WINDOW,
     )
 
     assert completed.returncode == 0, completed.stderr
@@ -38,7 +39,8 @@ def test_scheduler_installer_dry_run_has_safe_defaults() -> None:
     assert payload["operation"] == "install"
     assert payload["task_name"] == "mediaMGMT Movie Flow"
     assert payload["interval_minutes"] == 15
-    assert payload["arguments"] == "-m media_scope.movie_flow run"
+    assert payload["execute"].endswith(".venv\\Scripts\\pythonw.exe")
+    assert payload["arguments"] == "-m media_scope.windowless_launcher"
     assert payload["logon_type"] == "Interactive"
     assert payload["triggers"] == ["AtLogOn", "DailyRepeating"]
     assert payload["repetition_duration_hours"] == 24
@@ -68,6 +70,7 @@ def test_scheduler_remove_dry_run_does_not_unregister_anything() -> None:
         text=True,
         check=False,
         timeout=30,
+        creationflags=subprocess.CREATE_NO_WINDOW,
     )
 
     assert completed.returncode == 0, completed.stderr
