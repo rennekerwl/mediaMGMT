@@ -16,6 +16,7 @@ $ErrorActionPreference = "Stop"
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $pythonPath = Join-Path $repositoryRoot ".venv\Scripts\python.exe"
+$pythonwPath = Join-Path $repositoryRoot ".venv\Scripts\pythonw.exe"
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 
 if ($Remove) {
@@ -38,10 +39,13 @@ if ($Remove) {
 if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) {
     throw "The project virtual-environment Python executable was not found: $pythonPath"
 }
+if (-not (Test-Path -LiteralPath $pythonwPath -PathType Leaf)) {
+    throw "The project virtual-environment windowless Python executable was not found: $pythonwPath"
+}
 
-$actionArguments = "-m media_scope.movie_flow run"
+$actionArguments = "-m media_scope.windowless_launcher"
 $action = New-ScheduledTaskAction `
-    -Execute $pythonPath `
+    -Execute $pythonwPath `
     -Argument $actionArguments `
     -WorkingDirectory $repositoryRoot
 
@@ -71,7 +75,7 @@ $summary = [ordered]@{
     operation = "install"
     task_name = $TaskName
     interval_minutes = $IntervalMinutes
-    execute = $pythonPath
+    execute = $pythonwPath
     arguments = $actionArguments
     working_directory = $repositoryRoot
     user = $identity

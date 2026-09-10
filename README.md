@@ -371,13 +371,16 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File .\scripts\install_movie_flow_task.ps1 -Remove
 ```
 
-The task invokes the repository's absolute `.venv\Scripts\python.exe`, passes
-`-m media_scope.movie_flow run`, and uses the repository as its working directory.
-The virtual environment must therefore exist before installation. Because the task
-uses the current user's interactive token, it begins after Windows logon rather than
-before login and cannot continue while that user is logged out. Check
-`latest-status.json`, the per-stage logs, the command exit code in Task Scheduler, and
-Task Scheduler History when troubleshooting.
+The task invokes the repository's absolute `.venv\Scripts\pythonw.exe`, which runs
+the windowless launcher module. The launcher starts the sibling `.venv\Scripts\python.exe`
+with `-m media_scope.movie_flow run`, uses the repository as its working directory,
+suppresses child console windows, and waits for the flow's exit code. The virtual
+environment must therefore exist before installation. Because the task uses the
+current user's interactive token, it begins after Windows logon rather than before
+login and cannot continue while that user is logged out. Launcher stdout and stderr
+are retained in `.logs\movie-flow` (the newest 30 run logs, ignored by Git); check those
+files together with `latest-status.json`, the per-stage logs, the command exit code
+in Task Scheduler, and Task Scheduler History when troubleshooting.
 
 The validator processes recommendations in order and each movie's results by rank. It
 uses a direct magnet when available, constructs one from an infohash, or resolves a
