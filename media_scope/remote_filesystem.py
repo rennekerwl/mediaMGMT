@@ -274,6 +274,8 @@ class SftpRemoteFilesystem:
                 if exc.errno in {errno.ENOENT, errno.ENOTDIR}:
                     raise FileNotFoundError(str(exc)) from exc
                 self.close()
+                if retry and attempt == 0:
+                    continue
                 self._storage_error("The seedbox rejected a required remote path operation.")
             except SeedboxFilesystemError:
                 raise

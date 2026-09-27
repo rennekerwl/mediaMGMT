@@ -159,3 +159,26 @@ def test_sftp_rejects_an_unknown_host_key(monkeypatch: pytest.MonkeyPatch) -> No
     with pytest.raises(SeedboxFilesystemError) as captured:
         filesystem.home()
     assert captured.value.error_code == "SFTP_HOST_KEY_ERROR"
+
+
+def test_sftp_reconnects_after_idle_socket_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    clients = [FakeClient(), FakeClient()]
+    calls = 0
+
+    def first_lstat(_value: str) -> SimpleNamespace:
+        nonlocal calls
+        calls += 1
+        raise OSError("Connection closed by remote host")
+
+    clients[0].sftp.lstat = first_lstat  # type: ignore[method-assign]
+    install_fake_paramiko(monkeypatch, clients[0])
+    module = sys.modules["paramiko"]
+    next_client = iter(clients)
+    module.SSHClient = lambda: next(next_client)
+    filesystem = SftpRemoteFilesystem("seedbox.test", port=22, username="user", password="secret")
+
+    info = filesystem.lstat(PurePosixPath("/downloads/movie.mkv"))
+
+    assert info.is_file
+    assert calls == 1
+    assert clients[1].connected is not None
