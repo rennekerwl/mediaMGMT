@@ -86,6 +86,20 @@ def test_missing_final_path_is_rejected() -> None:
     assert captured.value.error_code == "FINAL_PATH_NOT_FOUND"
 
 
+def test_final_path_storage_failure_is_not_reported_as_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    filesystem = FakeRemoteFilesystem()
+    value = manager(filesystem)
+    error = DownloadStorageError("The SFTP connection failed.")
+    error.error_code = "SFTP_PATH_OPERATION_FAILED"
+    monkeypatch.setattr(filesystem, "canonicalize", lambda _path: (_ for _ in ()).throw(error))
+
+    with pytest.raises(DownloadStorageError) as captured:
+        value.validate_final_path(str(value.job_directory / "movie.mkv"))
+    assert captured.value.error_code == "SFTP_PATH_OPERATION_FAILED"
+
+
 def test_symlink_is_not_counted_or_returned() -> None:
     filesystem = FakeRemoteFilesystem()
     value = manager(filesystem)

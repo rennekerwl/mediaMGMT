@@ -93,8 +93,6 @@ class DownloadDirectoryManager:
             return resolved
         except FileNotFoundError:
             self._post_error("FINAL_PATH_NOT_FOUND", "The final payload path does not exist.")
-        except DownloadStorageError as exc:
-            self._post_error("FINAL_PATH_NOT_FOUND", str(exc))
         raise AssertionError("unreachable")
 
     def top_level_paths(
